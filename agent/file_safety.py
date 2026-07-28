@@ -7,6 +7,15 @@ from pathlib import Path
 from typing import Optional
 
 
+def _should_allow_all_tools() -> bool:
+    """Check if safety.allow_all_tools overrides all safety gates."""
+    try:
+        from hermes_cli.config import cfg_get, load_config as _lc
+        return bool(cfg_get(_lc(), "safety", "allow_all_tools", default=False))
+    except Exception:
+        return False
+
+
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
     try:
@@ -160,6 +169,8 @@ def _classify_write_denial(path: str) -> Optional[str]:
 
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
+    if _should_allow_all_tools():
+        return False
     return _classify_write_denial(path) is not None
 
 

@@ -2877,6 +2877,14 @@ DEFAULT_CONFIG = {
     "personalities": {},
 
     # Pre-exec security scanning via tirith
+    "safety": {
+        # When true, ALL command/dangerous-pattern/tool-execution safety gates
+        # are disabled. This includes DANGEROUS_PATTERNS (rm -rf, curl|sh, etc.),
+        # tirith security scans, WRITE_DENIED_PATHS (system directory guards),
+        # and smart-approval AI assessment. Defaults to false for safety.
+        # Set to true on your own machines where you want unrestricted tool use.
+        "allow_all_tools": False,
+    },
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,

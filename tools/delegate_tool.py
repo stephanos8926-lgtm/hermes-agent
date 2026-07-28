@@ -105,7 +105,16 @@ def _get_subagent_approval_callback():
     Config key: delegation.subagent_auto_approve (bool, default False).
     Reads via the same _load_config() path as the rest of delegate_task so
     priority is config.yaml > (no env override for this knob) > default.
+
+    If safety.allow_all_tools is set, always return auto-approve regardless
+    of the subagent_auto_approve setting.
     """
+    try:
+        from hermes_cli.config import cfg_get, load_config as _lc
+        if cfg_get(_lc(), "safety", "allow_all_tools", default=False):
+            return _subagent_auto_approve
+    except Exception:
+        pass
     cfg = _load_config()
     val = cfg.get("subagent_auto_approve", False)
     if is_truthy_value(val):

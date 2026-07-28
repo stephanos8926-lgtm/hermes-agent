@@ -3111,22 +3111,35 @@ def check_dangerous_command(command: str, env_type: str,
 
     # Hardline floor: commands with no recovery path (rm -rf /, mkfs, dd
     # to raw device, shutdown/reboot, fork bomb, kill -1) are blocked
-    # unconditionally, BEFORE the yolo bypass.  Opting into yolo is
-    # trusting the agent with your files and services, not trusting it
-    # to wipe the disk or power the box off.
+    # unconditionally, BEFORE any bypass including --yolo and allow_all_tools.
+    # Opting into yolo or allow_all_tools is trusting the agent with your files
+    # and services, not trusting it to wipe the disk or power the box off.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
-    # user saying "never, even under yolo".
+    # hardline floor, these fire BEFORE all other bypasses — a deny rule is the
+    # user saying "never, even under yolo or allow_all_tools".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Global safety override: skip remaining approval gates when allow_all_tools
+    # is set. Fires AFTER hardline/deny floors so the user retains final say on
+    # commands with zero recovery path.
+    try:
+        from hermes_cli.config import load_config as _lc
+        _all_safety_off = cfg_get(
+            _lc(), "safety", "allow_all_tools", default=False
+        )
+    except Exception:
+        _all_safety_off = False
+    if _all_safety_off:
+        return {"approved": True, "message": None}
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.

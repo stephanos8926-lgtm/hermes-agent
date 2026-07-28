@@ -1098,6 +1098,36 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
     return content
 
 
+def _capture_git_verification(agent) -> str:
+    """Run ``git log`` and return a compact summary of recent commits.
+
+    Provides ground-truth verification after compaction so the agent can
+    compare the LLM-generated summary against actual file changes.
+
+    Returns an empty string when:
+    * CWD is not a Git repository
+    * ``git`` is unavailable or exits non-zero
+    * No commits exist within the capture window
+
+    Bounded to the most recent 20 commits from HEAD (not merge-base).
+    """
+    import subprocess
+
+    cwd = getattr(agent, "working_directory", None) or os.getcwd()
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-20"],
+            capture_output=True, text=True, timeout=5, cwd=cwd,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        # Strip trailing whitespace; cap at 20 lines already guaranteed
+        return result.stdout.rstrip("\n")
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # Not a git repo, git missing, or permission error — fall silent
+        return ""
+
+
 def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
     """Fold the human anchor into an existing user-role scaffolding turn.
 
@@ -1962,6 +1992,40 @@ def compress_context(
                         "check auxiliary.compression.model in config.yaml."
                     )
 
+        # ── Git-log verification: ground truth about what actually changed ──
+        # The LLM summary claims "stuff happened." Git log is the single source
+        # of truth. This lets the agent verify the summary against reality.
+        git_verification = _capture_git_verification(agent)
+        if git_verification:
+            # Merge into trailing real user message when possible; otherwise
+            # append as a synthetic user-role block (same pattern as todo).
+            _git_merged = False
+            _tail = (
+                compressed[-1]
+                if compressed and isinstance(compressed[-1], dict)
+                else None
+            )
+            if _tail is not None and _tail.get("role") == "user":
+                _probe = {
+                    key: value for key, value in _tail.items() if key != "content"
+                }
+                if _is_real_user_message(_probe):
+                    _existing = _tail.get("content", "")
+                    _combined = (
+                        f"{_existing}\n\n[POST-COMPACTION GIT VERIFICATION]\n{git_verification}"
+                        if isinstance(_existing, str) and _existing.strip()
+                        else f"[POST-COMPACTION GIT VERIFICATION]\n{git_verification}"
+                    )
+                    _tail["content"] = _combined
+                    _git_merged = True
+            if not _git_merged:
+                compressed.append({
+                    "role": "user",
+                    "content": f"[POST-COMPACTION GIT VERIFICATION]\n{git_verification}",
+                    "_git_verification_synthetic": True,
+                })
+
+        # ── Todo snapshot injection ──
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
             # Fold the snapshot into a trailing REAL user message so
