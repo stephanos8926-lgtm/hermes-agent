@@ -1973,6 +1973,7 @@ class ContextCompressor(ContextEngine):
             0, int(proactive_prune_min_reclaim_tokens or 0)
         )
         self.min_tail_user_messages = min_tail_user_messages
+        self.custom_compaction_prompt = custom_compaction_prompt or ""
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
@@ -3358,6 +3359,14 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
         else:
             _temporal_anchoring_rule = ""
 
+        # Optional custom user instruction for compaction summaries.
+        if self.custom_compaction_prompt:
+            _custom_injection = (
+                "\n\nCUSTOM INSTRUCTION:\n" + self.custom_compaction_prompt + "\n"
+            )
+        else:
+            _custom_injection = ""
+
         # Shared structured template (used by both paths).
         _template_sections = f"""{HISTORICAL_TASK_HEADING}
 {_historical_task_instructions}
@@ -3408,7 +3417,7 @@ use. If none appear, omit this section entirely.]
 
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
-Write only the summary body. Do not include any preamble or prefix."""
+{_custom_injection}Write only the summary body. Do not include any preamble or prefix."""
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress.

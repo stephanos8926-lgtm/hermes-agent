@@ -1569,6 +1569,67 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+def _check_file_write_approval(path: str, task_id: str) -> str | None:
+    """Check if write_file requires approval based on per-tool policy.
+
+    Returns an error message if the action is blocked, or None if allowed.
+    Respects approvals.mode and any per-tool policies set in approvals.policies.write_file.
+    """
+    try:
+        from tools.approval import (
+            _get_effective_approval_mode,
+            is_approval_bypass_active,
+            request_tool_approval,
+        )
+
+        # Bypass modes override everything
+        if is_approval_bypass_active():
+            return None
+
+        effective_mode = _get_effective_approval_mode("write_file")
+
+        # If policy explicitly allows, skip approval
+        if effective_mode == "off":
+            return None
+
+        # Smart mode: check if path is sensitive enough to warrant approval
+        if effective_mode == "smart":
+            # Auto-approve for common safe paths
+            safe_patterns = [
+                "/tmp/", ".hermes/skills/", ".hermes/plugins/",
+                "node_modules/", "__pycache__/", ".git/",
+            ]
+            for pattern in safe_patterns:
+                if pattern in path:
+                    return None
+
+            # For anything else, require approval
+            result = request_tool_approval(
+                tool_name="write_file",
+                reason=f"Smart approval: write to {path}",
+                rule_key="smart_path_check",
+            )
+            if not result.get("approved"):
+                return f"BLOCKED: write_file requires approval ({result.get('message', 'denied')})"
+            return None
+
+        # Manual mode: always require approval
+        if effective_mode == "manual":
+            result = request_tool_approval(
+                tool_name="write_file",
+                reason=f"Manual approval required: write to {path}",
+                rule_key="manual_path_check",
+            )
+            if not result.get("approved"):
+                return f"BLOCKED: write_file requires approval ({result.get('message', 'denied')})"
+
+        return None
+
+    except Exception as e:
+        logger.debug("file_write approval check failed: %s", e)
+        return None
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1593,6 +1654,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Strip read_file line-number prefixes or reconstruct the intended "
             "file contents before writing."
         )
+
+    # Check approval requirements before proceeding with write
+    approval_result = _check_file_write_approval(path, task_id)
+    if approval_result:
+        return tool_error(approval_result)
     try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness

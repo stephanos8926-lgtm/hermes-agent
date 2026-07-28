@@ -2642,6 +2642,54 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _get_per_tool_policy(pattern_key: str) -> Optional[str]:
+    """Get per-tool approval policy from config.
+
+    Reads ``approvals.policies.<pattern_key>`` from config. If a specific
+    policy is defined for this tool/pattern, returns it (e.g. 'manual',
+    'smart', 'off'). Otherwise returns None to fall back to the global mode.
+
+    This enables fine-grained control: e.g. lock 'write_file' to 'manual'
+    while keeping other tools on 'smart'.
+    """
+    if not pattern_key:
+        return None
+
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        policies = config.get("approvals", {}).get("policies", {})
+        if not isinstance(policies, dict):
+            return None
+
+        # Direct match first
+        policy = policies.get(pattern_key)
+        if policy is not None:
+            return _normalize_approval_mode(str(policy).lower())
+
+        return None
+    except Exception as e:
+        logger.warning("Failed to load per-tool approval policy for %s: %s", pattern_key, e)
+        return None
+
+
+def _get_effective_approval_mode(pattern_key: str) -> str:
+    """Determine the effective approval mode for a specific tool/pattern.
+
+    Checks per-tool policy first, then falls back to global mode.
+    This allows granular control: some tools always require manual approval
+    regardless of the global setting.
+    """
+    # Check per-tool policy first
+    per_tool = _get_per_tool_policy(pattern_key)
+    if per_tool is not None:
+        logger.debug("Using per-tool approval policy '%s' for pattern '%s'", per_tool, pattern_key)
+        return per_tool
+
+    # Fall back to global mode
+    return _get_approval_mode()
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -2806,6 +2854,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    per_tool_pattern_key: str | None = None,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2842,6 +2891,11 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        per_tool_pattern_key: If set, enables per-tool policy lookup for
+            this gate. The effective mode (manual/smart/off) is resolved
+            against ``approvals.policies.<per_tool_pattern_key>`` first,
+            falling back to the global ``approvals.mode``. Used by
+            write_file / patch to honor fine-grained policy overrides.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -2856,6 +2910,11 @@ def _run_approval_gate(
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    # Per-tool policy override: if a specific policy is set for this tool,
+    # use it instead of the global mode. Enables granular control — e.g.
+    # lock file_write to 'manual' while keeping other tools on 'smart'.
+    effective_mode = _get_effective_approval_mode(per_tool_pattern_key)
 
     if approval_callback is None:
         try:

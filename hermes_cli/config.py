@@ -1584,6 +1584,14 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
+        "custom_compaction_prompt": "",   # Optional free-text injection that gets
+                                          # inserted verbatim into every compaction
+                                          # summary prompt (both first-compaction and
+                                          # iterative-update). Useful for injecting
+                                          # project-specific instructions like
+                                          # "preserve session state in SESSION_STATE.md"
+                                          # or "never drop TODO comments". When empty
+                                          # (default), no custom text is injected.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

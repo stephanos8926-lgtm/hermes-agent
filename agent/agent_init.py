@@ -1980,6 +1980,11 @@ def init_agent(
     compression_idle_compact_after_seconds = max(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
     )
+    # Optional free-text injected into every compaction summary prompt.
+    # Allows project-specific instructions (e.g. "preserve SESSION_STATE.md").
+    compression_custom_prompt = str(
+        _compression_cfg.get("custom_compaction_prompt", "")
+    ).strip() or None
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -2399,6 +2404,7 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            custom_compaction_prompt=compression_custom_prompt,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
