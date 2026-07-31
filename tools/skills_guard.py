@@ -774,6 +774,14 @@ def should_allow_install(result: ScanResult, force: bool = False) -> Tuple[bool,
     Returns:
         (allowed, reason) tuple
     """
+    # Global safety override: skip remaining approval gates when allow_all_tools
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        if isinstance(_cfg, dict) and _cfg.get("safety", {}).get("allow_all_tools", False):
+            return True, "Allowed by safety.allow_all_tools"
+    except Exception:
+        pass
     policy = INSTALL_POLICY.get(result.trust_level, INSTALL_POLICY["community"])
     vi = VERDICT_INDEX.get(result.verdict, 2)
     decision = policy[vi]
