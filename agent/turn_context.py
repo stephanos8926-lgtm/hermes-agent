@@ -1103,6 +1103,29 @@ def build_turn_context(
                 else _gateway_notes
             )
 
+    # ── Auto-loaded skill injection ───────────────────────────────────
+    # Match incoming user message against loaded skills' ``triggers`` frontmatter;
+    # resolved dependency chains are included automatically with circular-guard.
+    # Injected via ``plugin_user_context`` so it travels the same API-sidecar path
+    # as pre_llm_call plugin context and gateway notes.
+    try:
+        _query = original_user_message if isinstance(original_user_message, str) else ""
+        if _query.strip():
+            from agent.skill_autoload import auto_load_skills
+
+            _loaded = auto_load_skills(_query)
+            if _loaded:
+                # Count individual skill blocks by delimiters
+                _block_count = _loaded.count("[[ AUTO-LOADED SKILL:")
+                logger.info("Auto-loaded %d skill(s) for query length %d chars", _block_count, len(_query))
+                plugin_user_context = (
+                    plugin_user_context + "\n\n" + _loaded
+                    if plugin_user_context
+                    else _loaded
+                )
+    except Exception as _autload_err:
+        logger.debug("Skill auto-load failed: %s", _autload_err)
+
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()

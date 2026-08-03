@@ -1031,13 +1031,22 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         # requiring the server to live on localhost.
         resolved_base_url = config.base_url
         resolved_timeout = config.timeout
-        if not resolved_base_url or resolved_timeout is None:
+        # Treat SDK-resolved localhost URLs as empty so config.yaml's
+        # explicit honcho.base_url can take precedence (remote deployments
+        # on infra/dev VMs, etc.). Non-localhost URLs from the SDK (e.g.
+        # production api.honcho.dev) are left untouched.
+        is_default_localhost = (
+            _is_local_base_url(resolved_base_url)
+            if resolved_base_url
+            else False
+        )
+        if not resolved_base_url or is_default_localhost or resolved_timeout is None:
             try:
                 from hermes_cli.config import load_config
                 hermes_cfg = load_config()
                 honcho_cfg = hermes_cfg.get("honcho", {})
                 if isinstance(honcho_cfg, dict):
-                    if not resolved_base_url:
+                    if not resolved_base_url or is_default_localhost:
                         resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
                     if resolved_timeout is None:
                         resolved_timeout = _resolve_optional_float(

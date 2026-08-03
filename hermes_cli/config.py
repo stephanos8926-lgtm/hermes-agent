@@ -2582,6 +2582,28 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Auto-load skills whose ``triggers`` frontmatter field matches the
+        # incoming user message.  Matched skill bodies are injected as pre-
+        # response context (same channel as plugin ``pre_llm_call`` hooks).
+        #   false (default) — off; skills must still be invoked manually.
+        #   true              — on; matching skills auto-inject before API call.
+        "autoload_enabled": False,
+        # Minimum trigger-match score to qualify a skill for injection.
+        # Each matching trigger substring counts +1; raise if you get too
+        # many false-positive hits on short descriptions.
+        "autoload_min_score": 1,
+        # Maximum dependency resolution depth when auto-loading.
+        # When skill A declares dependencies on B and C, and B depends on D,
+        # the chain resolves A → [B,D,C] at depth 2. Higher values risk more
+        # injected context and deeper circular-reference edge cases.
+        "autoload_dependency_depth": 3,
+        # Character limit for each auto-injected skill body (~1K tokens).
+        # Prevents huge SKILL.md files from bloating the context window.
+        "autoload_body_cap_chars": 4096,
+        # Maximum number of distinct skills auto-loaded in one turn.
+        # Includes both matched skills and their resolved dependencies.
+        # Keeps token budget predictable.
+        "autoload_max_skills": 2,
     },
 
     # Curator — background skill maintenance.
