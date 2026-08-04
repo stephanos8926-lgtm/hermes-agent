@@ -11,6 +11,8 @@ import sys
 import threading
 import contextvars
 from collections import OrderedDict
+import re
+import logging
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
@@ -45,6 +47,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
+
+
+# Matches ${VAR_NAME} patterns — only uppercase letters, digits, underscore.
+# Deliberately does NOT match ${…} with nested braces or shell substitution syntax.
+_ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+
+
+def _expand_env_vars(text: str) -> str:
+    """Substitute ${VAR_NAME} placeholders with os.environ values.
+
+    Unknown variables are left as-is (not expanded to empty string) so that
+    misconfigured placeholders are visible in the system prompt rather than
+    silently disappearing.
+
+    This runs on both environment_hint (config) and SOUL.md content before
+    they reach the LLM, so one .env file controls agent identity across
+    all machines.
+    """
+    def _replacer(match):
+        var_name = match.group(1)
+        return os.environ.get(var_name, match.group(0))
+    return _ENV_VAR_RE.sub(_replacer, text)
 
 
 def _scan_context_content(content: str, filename: str) -> str:
@@ -1232,6 +1256,7 @@ def build_environment_hints() -> str:
         except Exception as e:
             logger.debug("Could not read agent.environment_hint from config: %s", e)
     if extra:
+        extra = _expand_env_vars(extra)
         hints.append(extra)
 
     return "\n\n".join(hints)
@@ -1905,6 +1930,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
+        content = _expand_env_vars(content)
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
