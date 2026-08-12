@@ -359,6 +359,19 @@ def _build_skill_message(
             f'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
+        # RapidWebs fork feature (B): auto-load reference content (capped +
+        # truncated with a pointer) when skills.auto_load is enabled.
+        try:
+            from agent.skill_auto_load import auto_load_references
+
+            _autoload_block = auto_load_references(skill_dir)
+            if _autoload_block:
+                parts.append("")
+                parts.append("[Auto-loaded supporting content:]")
+                parts.append(_autoload_block)
+        except Exception:
+            # Reference auto-load must never break the skill message build.
+            logger.debug("failed to auto-load skill references", exc_info=True)
 
     if user_instruction:
         parts.append("")
