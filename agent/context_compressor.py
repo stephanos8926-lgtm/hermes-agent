@@ -3062,6 +3062,7 @@ class ContextCompressor(ContextEngine):
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
         summary_model_override: str = None,
+        compaction_prompt_override: str = None,
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
@@ -3086,6 +3087,18 @@ class ContextCompressor(ContextEngine):
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "legacy"
+        # Custom compaction prompt override (compression.prompt / CONTEXT_COMPRESSION_PROMPT).
+        # When set (non-empty after strip), it REPLACES the default summarizer
+        # preamble in the batch + micro compaction prompts. The structural
+        # template, token target, temporal-anchoring, and security rules are
+        # always re-appended on top of whatever the custom preamble says, so an
+        # override can steer the summarizer's tone/emphasis but cannot disable
+        # the [REDACTED] credential rule or the stable output structure.
+        self.compaction_prompt = (
+            compaction_prompt_override.strip()
+            if compaction_prompt_override and compaction_prompt_override.strip()
+            else None
+        )
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
@@ -4765,6 +4778,22 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
             "with [REDACTED]. Note that credentials were present, but do not "
             "preserve their values."
         )
+        # Custom compaction prompt: when configured, it replaces the default
+        # preamble while the structural/security directives remain in effect
+        # (they are appended again below via the prompt blocks' fixed parts and
+        # the [REDACTED] rule above is already folded into the template).
+        # getattr-guarded: bare ``ContextCompressor.__new__`` test doubles skip
+        # __init__, so the attribute may be absent — treat that as no override.
+        if getattr(self, "compaction_prompt", None):
+            _summarizer_preamble = (
+                self.compaction_prompt
+                + "\n\n"
+                + "Produce only the structured summary; do not add a greeting, "
+                "preamble, or prefix. "
+                + "NEVER include API keys, tokens, passwords, secrets, "
+                "credentials, or connection strings in the summary — replace "
+                "any that appear with [REDACTED]."
+            )
 
         # Temporal anchoring directive. Rewrites relative / still-pending-sounding
         # references into absolute, dated, past-tense facts so a resumed
@@ -6542,22 +6571,40 @@ This compaction should PRIORITISE preserving all information related to the focu
         else:
             summary_block = "(No previous summary yet.)"
 
-        user_prompt = (
-            "You are a summarization agent creating a compact record of an "
-            "ongoing conversation.  You are given a running summary and the "
-            "next exchange from the conversation.  Merge the exchange's key "
-            "decisions, requirements, file paths, and open questions into the "
-            "summary.  Preserve the summary's structure.  Drop resolved details "
-            "that are no longer relevant.  Add new decisions, file paths, and "
-            "open questions.\n\n"
-            "NEVER include API keys, tokens, passwords, secrets, credentials, "
-            "or connection strings in the summary \u2014 replace any that appear "
-            f"with [REDACTED].\n\n"
-            f"## Current Running Summary\n{summary_block}\n\n"
-            f"## Next Exchange to Merge\n{exchange_text}\n\n"
-            "Return ONLY the updated summary text, no preamble or explanation. "
-            "Do not include this instruction block in your output."
-        )
+        if getattr(self, "compaction_prompt", None):
+            _custom_compaction_prompt = self.compaction_prompt
+            user_prompt = (
+                _custom_compaction_prompt
+                + "\n\n"
+                + "Merge the exchange's key decisions, requirements, file paths, "
+                "and open questions into the summary.  Preserve the summary's "
+                "structure.  Drop resolved details that are no longer relevant.  "
+                "Add new decisions, file paths, and open questions.\n\n"
+                "NEVER include API keys, tokens, passwords, secrets, credentials, "
+                "or connection strings in the summary \u2014 replace any that appear "
+                f"with [REDACTED].\n\n"
+                f"## Current Running Summary\n{summary_block}\n\n"
+                f"## Next Exchange to Merge\n{exchange_text}\n\n"
+                "Return ONLY the updated summary text, no preamble or explanation. "
+                "Do not include this instruction block in your output."
+            )
+        else:
+            user_prompt = (
+                "You are a summarization agent creating a compact record of an "
+                "ongoing conversation.  You are given a running summary and the "
+                "next exchange from the conversation.  Merge the exchange's key "
+                "decisions, requirements, file paths, and open questions into the "
+                "summary.  Preserve the summary's structure.  Drop resolved details "
+                "that are no longer relevant.  Add new decisions, file paths, and "
+                "open questions.\n\n"
+                "NEVER include API keys, tokens, passwords, secrets, credentials, "
+                "or connection strings in the summary \u2014 replace any that appear "
+                f"with [REDACTED].\n\n"
+                f"## Current Running Summary\n{summary_block}\n\n"
+                f"## Next Exchange to Merge\n{exchange_text}\n\n"
+                "Return ONLY the updated summary text, no preamble or explanation. "
+                "Do not include this instruction block in your output."
+            )
 
         return [
             {"role": "system", "content": "You are a conversation summarization assistant."},

@@ -4754,6 +4754,10 @@ def show_config():
         comp_provider = _aux_comp.get('provider', 'auto')
         if comp_provider and comp_provider != 'auto':
             print(f"  Provider:     {comp_provider}")
+        _cprompt = compression.get('prompt', '')
+        if _cprompt:
+            _disp = _cprompt[:60] + ("..." if len(_cprompt) > 60 else "")
+            print(f"  Prompt:       {_disp}")
     
     # Auxiliary models
     auxiliary = config.get('auxiliary', {})

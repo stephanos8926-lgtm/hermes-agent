@@ -3389,6 +3389,31 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # Post-compaction git-truth injection (RapidWebs fork feature).
+        # Compaction is the one point where the system prompt is legitimately
+        # rebuilt, so it is the correct (cache-safe) place to re-anchor the agent
+        # to current repository reality after history was summarized. Gated by
+        # compression.inject_git_truth (default on). Read-only + time-boxed.
+        try:
+            _inject_truth = True
+            try:
+                _cfg_truth = getattr(agent, "config", None) or {}
+                _comp_cfg = _cfg_truth.get("compression", {}) if isinstance(_cfg_truth, dict) else {}
+                _inject_truth = bool(_comp_cfg.get("inject_git_truth", True))
+            except Exception:
+                _inject_truth = True  # default ON if config unreadable
+            if _inject_truth:
+                from agent.git_truth import build_git_truth_block
+
+                _truth_cwd = getattr(agent, "working_directory", None) or os.getcwd()
+                _truth_block = build_git_truth_block(cwd=_truth_cwd, inject=True)
+                if _truth_block and isinstance(new_system_prompt, str):
+                    new_system_prompt = new_system_prompt.rstrip() + "\n\n" + _truth_block
+                    agent._cached_system_prompt = new_system_prompt
+        except Exception:
+            # Git-truth probing must NEVER break the prompt build.
+            pass
+
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
