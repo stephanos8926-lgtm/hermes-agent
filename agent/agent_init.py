@@ -2033,6 +2033,15 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Custom compaction prompt (compression.prompt). When non-empty after
+    # strip, replaces the default summarizer preamble in batch + micro
+    # compaction prompts. Threaded to ContextCompressor(compaction_prompt_override).
+    _raw_compaction_prompt = _compression_cfg.get("prompt", "")
+    compression_prompt = (
+        _raw_compaction_prompt.strip()
+        if isinstance(_raw_compaction_prompt, str) and _raw_compaction_prompt.strip()
+        else None
+    )
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2523,6 +2532,7 @@ def init_agent(
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
             summary_model_override=None,
+            compaction_prompt_override=compression_prompt,
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),
