@@ -180,3 +180,119 @@ def test_build_auto_load_prompt_disabled_returns_empty():
     )
     # disabled by default → empty
     assert block == "" and names == []
+
+
+# ── New: candidate index + invoke-site wrapper ──────────────────────────────
+# These use a synthetic HERMES_HOME skills tree (via monkeypatch of the
+# candidate scan roots) so they don't depend on the live skills directory.
+
+
+def _build_candidates_from_tree(root: Path, cfg) -> list:
+    """Exercise build_candidates against a synthetic skills tree.
+
+    Monkeypatch get_all_skills_dirs+iter_skill_index_files to point at
+    ``root`` only, then clear the candidate cache so the scan runs fresh.
+    """
+    import agent.skill_utils as su
+
+    def _fake_dirs():
+        return [root]
+
+    def _fake_iter(sk_dir, filename):
+        if filename == "SKILL.md":
+            for f in root.rglob("SKILL.md"):
+                yield f
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(su, "get_all_skills_dirs", _fake_dirs)
+    monkey.setattr(su, "iter_skill_index_files", _fake_iter)
+    s._CANDIDATES_CACHE.clear()
+    try:
+        return s.build_candidates(cfg)
+    finally:
+        monkey.undo()
+
+
+def test_build_candidates_parses_frontmatter_and_schema(tmp_path):
+    # top-level triggers + newer metadata.hermes.tags both surface
+    cat = tmp_path / "dev"
+    cat.mkdir()
+    (cat / "foo").mkdir()
+    (cat / "foo" / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: a foo skill\ntriggers: ['foo', 'foo thing']\n"
+        "related_skills: ['bar']\n---\n# Foo\n"
+    )
+    (cat / "bar").mkdir()
+    (cat / "bar" / "SKILL.md").write_text(
+        "---\nname: bar\ndescription: a bar skill\nmetadata:\n  hermes:\n    tags: ['barry', 'baz']\n    related_skills: ['foo']\n---\n# Bar\n"
+    )
+    cfg = _cfg(enabled=True)
+    cands = _build_candidates_from_tree(tmp_path, cfg)
+    by_name = {c["name"]: c for c in cands}
+    assert "foo" in by_name
+    assert "foo" in by_name["foo"]["triggers"]
+    assert "foo thing" in by_name["foo"]["triggers"]
+    assert "bar" in by_name["foo"]["related_skills"] or "bar" in by_name["foo"].get("related_skills", [])
+    # metadata.hermes.tags surfaced as triggers for 'bar'
+    assert "barry" in by_name["bar"]["triggers"]
+    assert "baz" in by_name["bar"]["triggers"]
+    # metadata.hermes.related_skills surfaced
+    assert "foo" in by_name["bar"]["related_skills"]
+
+
+def test_build_candidates_skips_disabled(tmp_path, monkeypatch):
+    cat = tmp_path / "dev"
+    cat.mkdir()
+    (cat / "enabled-skill").mkdir()
+    (cat / "enabled-skill" / "SKILL.md").write_text(
+        "---\nname: enabled-skill\ndescription: e\ntriggers: ['go']\n---\n# e\n"
+    )
+    (cat / "disabled-skill").mkdir()
+    (cat / "disabled-skill" / "SKILL.md").write_text(
+        "---\nname: disabled-skill\ndescription: d\ntriggers: ['stop']\n---\n# d\n"
+    )
+    monkeypatch.setattr(
+        "agent.skill_utils.get_disabled_skill_names", lambda: {"disabled-skill"}
+    )
+    cfg = _cfg(enabled=True)
+    cands = _build_candidates_from_tree(tmp_path, cfg)
+    names = {c["name"] for c in cands}
+    assert "enabled-skill" in names
+    assert "disabled-skill" not in names
+
+
+def test_auto_load_for_message_fires_and_respects_budget(tmp_path):
+    cat = tmp_path / "dev"
+    cat.mkdir()
+    (cat / "alpha").mkdir()
+    (cat / "alpha" / "SKILL.md").write_text(
+        "---\nname: alpha\ndescription: an alpha skill\ntriggers: ['alpha']\n"
+        "related_skills: ['beta']\n---\n# Alpha\n"
+    )
+    (cat / "beta").mkdir()
+    (cat / "beta" / "SKILL.md").write_text(
+        "---\nname: beta\ndescription: a beta skill\ntriggers: ['beta']\n"
+        "related_skills: ['alpha']\n---\n# Beta\n"
+    )
+    cfg = _cfg(enabled=True, max_auto_load=2, min_confidence=0.5)
+    s._CANDIDATES_CACHE.clear()
+
+    import agent.skill_utils as su
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(su, "get_all_skills_dirs", lambda: [tmp_path])
+    monkey.setattr(
+        su,
+        "iter_skill_index_files",
+        lambda d, fn: (f for f in tmp_path.rglob("SKILL.md")) if fn == "SKILL.md" else iter(()),
+    )
+    # keep module-level auto-load disabled to isolate this invocation
+    monkey.setattr(s, "load_auto_load_config", lambda: cfg)
+    s.reset_session("auto-session")
+    try:
+        block, names = s.auto_load_for_message("do alpha for me", session_id="auto-session")
+    finally:
+        monkey.undo()
+    assert "alpha" in names
+    assert len(names) <= 2  # budget incl. related expansion
+    assert "[Auto-loaded skill: alpha]" in block

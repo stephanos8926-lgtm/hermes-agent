@@ -91,6 +91,170 @@ def is_enabled() -> bool:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Candidate index — frontmatter-only scan, filesystem-fingerprint cached
+# ────────────────────────────────────────────────────────────────────────────
+_CANDIDATES_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_CANDIDATES_CACHE_TTL = 30.0  # seconds
+
+
+def _scan_fingerprint(roots) -> str:
+    """Cheap filesystem fingerprint over the skills roots.
+
+    ``(count, newest_mtime)`` of every ``SKILL.md``. Any skill add/remove/edit
+    changes the fingerprint, forcing rescan — but a plain per-turn message
+    that touches nothing does not. This is the whole point: trigger scoring
+    must never re-read 150+ SKILL.md files every message.
+    """
+    from pathlib import Path
+
+    entries = []  # (path_str, mtime_ns)
+    for root in roots:
+        root_p = Path(root)
+        if not root_p.is_dir():
+            continue
+        for skill_md in root_p.rglob("SKILL.md"):
+            try:
+                st = skill_md.stat()
+            except OSError:
+                continue
+            entries.append((str(skill_md), st.st_mtime_ns, st.st_size))
+    entries.sort()
+    return repr(entries)
+
+
+def build_candidates(config: Optional[dict] = None) -> List[Dict[str, Any]]:
+    """Return the auto-load candidate list (frontmatter only).
+
+    Each candidate is ``{name, description, triggers, negative_triggers,
+    related_skills}``. Scans the local skills root + ``skills.external_dirs``
+    once and caches for a short TTL behind a filesystem fingerprint, so the
+    per-turn cost of building candidates is a single recursive glob + stat
+    (cheap) rather than parsing every SKILL.md.
+
+    Skips disabled skills, non-platform skills, and skills without a usable
+    ``name``. Never raises; returns [] on failure.
+    """
+    cfg = config or load_auto_load_config()
+
+    try:
+        from agent.skill_utils import (
+            get_all_skills_dirs,
+            iter_skill_index_files,
+            parse_frontmatter,
+        )
+    except Exception:
+        logger.debug("skill_utils unavailable for candidate scan", exc_info=True)
+        return []
+
+    roots = list(get_all_skills_dirs())
+    fp = _scan_fingerprint(roots)
+
+    now = time.time()
+    cached = _CANDIDATES_CACHE.get("skills")
+    if cached is not None and cached[0] >= now and cached[1] == fp:
+        return [dict(c) for c in cached[2]]
+
+    try:
+        from agent.skill_utils import (
+            skill_matches_platform,
+            skill_matches_environment,
+            is_excluded_skill_path,
+        )
+        from agent.skill_utils import get_disabled_skill_names
+    except Exception:
+        skill_matches_platform = lambda _fm: True  # noqa: E731
+        skill_matches_environment = lambda _fm: True  # noqa: E731
+        is_excluded_skill_path = lambda _p, **_kw: False  # noqa: E731
+
+    try:
+        disabled = set(get_disabled_skill_names())
+    except Exception:
+        disabled = set()
+
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for root in roots:
+        if not _Path_is_dir(root):
+            continue
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                if any(part in _EXCLUDED_SKILL_PARTS for part in skill_md.parts):
+                    continue
+                if is_excluded_skill_path(skill_md, root=root):
+                    continue
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:6000]
+                fm, _body = parse_frontmatter(content)
+                if not skill_matches_platform(fm):
+                    continue
+                if not skill_matches_environment(fm):
+                    continue
+                name = str(fm.get("name") or skill_md.parent.name or "").strip()
+                if not name or name in seen or name in disabled:
+                    continue
+                desc = str(fm.get("description") or "")[:2000]
+                triggers = fm.get("triggers") or []
+                if isinstance(triggers, str):
+                    triggers = [triggers]
+                neg = fm.get("negative_triggers") or []
+                if isinstance(neg, str):
+                    neg = [neg]
+                related = fm.get("related_skills") or []
+                if isinstance(related, str):
+                    related = [related]
+                # Newer schema: metadata.hermes.tags / related_skills. Merge
+                # them so skills that declare triggers only via metadata.tags
+                # still score (astro/deep-dive restored skills use this).
+                _meta = fm.get("metadata") or {}
+                if isinstance(_meta, dict):
+                    _hermes = _meta.get("hermes") or {}
+                    if isinstance(_hermes, dict):
+                        _tags = _hermes.get("tags") or []
+                        if isinstance(_tags, str):
+                            _tags = [_tags]
+                        for t in _tags:
+                            t = str(t).strip()
+                            if t:
+                                triggers.append(t)
+                        _rel = _hermes.get("related_skills") or []
+                        if isinstance(_rel, str):
+                            _rel = [_rel]
+                        for r in _rel:
+                            r = str(r).strip()
+                            if r:
+                                related.append(r)
+                seen.add(name)
+                candidates.append({
+                    "name": name,
+                    "description": desc,
+                    "triggers": list(triggers),
+                    "negative_triggers": list(neg),
+                    "related_skills": list(related),
+                })
+            except Exception:
+                logger.debug("auto-load candidate scan skip %s", skill_md, exc_info=True)
+                continue
+
+    _CANDIDATES_CACHE["skills"] = (now + _CANDIDATES_CACHE_TTL, fp, candidates)
+    return [dict(c) for c in candidates]
+
+
+def _Path_is_dir(p) -> bool:
+    from pathlib import Path
+    try:
+        return Path(str(p)).is_dir()
+    except Exception:
+        return False
+
+
+# Excluded directories/primitives mirrored from tools.skills_tool discovery.
+_EXCLUDED_SKILL_PARTS = {
+    ".archive", ".curator_backups", ".hub", ".git", "__pycache__",
+    "node_modules", "venv", ".venv", ".obsidian", "scripts",
+}
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # A — Trigger scoring
 # ────────────────────────────────────────────────────────────────────────────
 _WORD_RE = re.compile(r"\b([\w][\w\-']*)\b")
@@ -335,7 +499,13 @@ def build_auto_load_prompt(
     # relevant dependents exactly once (C) with recursion termination (D).
     to_load = list(selected)
     seen: set[str] = set()
-    while to_load:
+    # Hard total cap: max_auto_load bounds the TOTAL auto-loaded skills per
+    # turn (top-level + related-skill expansion). Without this, a skill with
+    # many related_skills — or several top-level matches — can expand far past
+    # the configured budget and inflate context. max_reference_files remains
+    # the related-sibling budget; max_auto_load is the absolute ceiling.
+    budget = max(1, int(cfg.get("max_auto_load", 3)))
+    while to_load and len(loaded_names) < budget:
         skill = to_load.pop(0)
         name = str(skill.get("name") or "").strip()
         if not name:
@@ -435,3 +605,54 @@ def auto_load_references(
             total_files += 1
 
     return "\n\n".join(blocks)
+
+
+def auto_load_for_message(
+    message: str,
+    session_id: Any = None,
+) -> str:
+    """High-level trigger auto-load entry point for the agent loop.
+
+    Given the current incoming user ``message``, returns a ready-to-inject
+    context block (may be "") of auto-loaded skills, or "" when auto-load is
+    disabled, no skill clears the confidence threshold, or anything fails.
+
+    This is the invoke-site wrapper that wires ``build_candidates`` (frontmatter
+    scan, fingerprint-cached) into ``build_auto_load_prompt`` (select + dedup +
+    related-skill recursion). It is intended to be called from the per-turn
+    message pipeline so the *selected* skill's full content reaches THIS turn's
+    request without an explicit ``skill_view`` call — the A-side behaviour the
+    feature was designed for.
+
+    All read-only, time-bounded, exception-tolerant — never crashes the loop.
+
+    Returns a tuple ``(block, loaded_names)`` for observability/logging.
+    """
+    try:
+        if not is_enabled() or not message:
+            return "", []
+        candidates = build_candidates()
+        if not candidates:
+            return "", []
+        return build_auto_load_prompt(
+            message,
+            candidates,
+            session_id=session_id,
+            resolver=_resolve_skill_candidate,
+        )
+    except Exception:
+        logger.debug("auto_load_for_message failed", exc_info=True)
+        return "", []
+
+
+def _resolve_skill_candidate(name: str) -> Optional[dict]:
+    """Resolve a related_skills name to a candidate dict (or None)."""
+    if not name:
+        return None
+    try:
+        for cand in build_candidates():
+            if str(cand.get("name") or "").strip().lower() == str(name).strip().lower():
+                return cand
+    except Exception:
+        logger.debug("auto-load resolver failed for %r", name, exc_info=True)
+    return None
