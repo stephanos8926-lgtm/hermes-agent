@@ -1185,6 +1185,41 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Core skill auto-load (RapidWebs fork): trigger-based injection of
+    # relevant skills into THIS turn's request. Runs in the same user-message
+    # injection channel as plugin context so the cached system prompt stays
+    # byte-stable. Config-gated (skills.auto_load.enabled), read-only,
+    # exception-tolerant — returns "" when disabled or no skill clears the
+    # confidence threshold, so it never breaks the prompt build or the cache
+    # prefix. Only strings are appended; the api_content sidecar carries it
+    # while the stored user content stays clean (#48677 replay contract).
+    try:
+        from agent.skill_auto_load import auto_load_for_message
+        from agent.skill_auto_load import bump_turn
+
+        _autoload_block, _autoload_names = auto_load_for_message(
+            original_user_message
+            if isinstance(original_user_message, str)
+            else (user_message if isinstance(user_message, str) else ""),
+            session_id=agent.session_id,
+        )
+        if _autoload_names:
+            bump_turn(agent.session_id)
+            if _autoload_block:
+                plugin_user_context = (
+                    plugin_user_context + "\n\n" + _autoload_block
+                    if plugin_user_context
+                    else _autoload_block
+                )
+            logger.debug(
+                "skill auto-load: %d skill(s) injected for session=%s",
+                len(_autoload_names),
+                agent.session_id or "none",
+            )
+    except Exception as _al_exc:
+        # Auto-load must never fail the turn.
+        logger.debug("skill auto-load failed: %s", _al_exc)
+
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
     # plugin context so the ephemeral system prompt can stay byte-stable.
