@@ -2139,8 +2139,21 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # Allow plugin engines to compress even when built-in compression.enabled=false
+        _is_plugin_engine = False
+        if hasattr(_compressor, "should_compress_preflight"):
+            _base_fn = getattr(
+                __import__("agent.context_engine", fromlist=["ContextEngine"]).ContextEngine,
+                "should_compress_preflight",
+            )
+            _engine_fn = getattr(_compressor, "should_compress_preflight")
+            # Compare underlying functions to avoid bound-method identity mismatch
+            _is_plugin_engine = (
+                callable(_engine_fn)
+                and getattr(_engine_fn, "__func__", _engine_fn) is not _base_fn
+            )
         if (
-            agent.compression_enabled
+            (agent.compression_enabled or _is_plugin_engine)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2258,7 +2271,7 @@ def run_conversation(
                     break
                 continue
         elif (
-            agent.compression_enabled
+            (agent.compression_enabled or _is_plugin_engine)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _defer_preflight(request_pressure_tokens)
@@ -6752,8 +6765,17 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                # Allow plugin engines to compress even when built-in compression.enabled=false
+                _is_plugin_engine = (
+                    hasattr(_compressor, "should_compress_preflight")
+                    and _compressor.should_compress_preflight
+                    is not getattr(
+                        __import__("agent.context_engine", fromlist=["ContextEngine"]).ContextEngine,
+                        "should_compress_preflight",
+                    )
+                )
                 if (
-                    agent.compression_enabled
+                    (agent.compression_enabled or _is_plugin_engine)
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -6804,7 +6826,7 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
-                elif agent.compression_enabled:
+                elif (agent.compression_enabled or _is_plugin_engine):
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
                     # the user isn't left with a silently growing context that
