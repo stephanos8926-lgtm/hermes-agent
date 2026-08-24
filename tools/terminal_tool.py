@@ -1279,6 +1279,36 @@ def clear_task_env_overrides(task_id: str):
     clear_session_cwd(task_id)
 
 
+def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Optional[str]:
+    """Host directory for a task's container cwd mount (legacy fork model).
+
+    Restored to fix a merge regression: upstream `main` introduced this
+    symbol (along with per-session Docker isolation) and its callers in
+    tools/file_tools.py and tools/code_execution_tool.py import it, but the
+    feature/rw-live merge kept the fork's older (non-isolated) Docker cwd
+    model, which never defined it.  That made read_file / execute_code
+    raise ImportError on `from tools.terminal_tool import
+    _resolve_task_host_cwd`.
+
+    This matches the fork's *current* behavior (see the legacy gate below),
+    NOT upstream's per-session isolation model.  It preserves existing
+    container mount semantics exactly while restoring the import contract.
+    """
+    if config.get("env_type") != "docker":
+        return None
+    if not config.get("host_cwd") or not config.get("docker_mount_cwd_to_workspace"):
+        return None
+    # Per-task override (matches _resolve_container_task_id collapse).  Only
+    # an explicit session/ACP-attached cwd may override the global host_cwd.
+    overrides = resolve_task_overrides(task_id)
+    candidate = overrides.get("cwd")
+    if isinstance(candidate, str) and candidate.strip():
+        candidate = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.isdir(candidate):
+            return candidate
+    return config.get("host_cwd")
+
+
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     Map a tool-call ``task_id`` to the container/sandbox key used by
