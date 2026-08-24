@@ -4,12 +4,21 @@
 // `window.read.request` from the gateway, asks main over IPC, and answers
 // with this module's serialized result. Enumeration uses `get-windows`
 // (front-to-back z-order on macOS/Windows/Linux-X11); the picking logic is a
-// pure function so the OS-specific part stays a thin provider.
+// pure function so the OS-specific part stays a thin provider. Where that
+// provider can't run at all, the answer is why — see `enumerationFailureNote`.
 //
 // Privacy contract (matches the tool schema): metadata only — app, title,
 // bounds. Never pixels. On macOS, window titles require the Screen Recording
 // permission; we pass titles through only when that permission is ALREADY
 // granted and never trigger the prompt for it.
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+import { app } from 'electron'
+
+import { readHyprlandWindows } from './hyprland'
 
 export interface EnumeratedWindow {
   app: string
@@ -29,6 +38,56 @@ export interface WindowBelowResult {
     id: number
     title: string
   } | null
+}
+
+export interface WindowBelowUnavailable {
+  error: string
+  platform: string
+}
+
+/**
+ * Why enumeration just failed, in terms the user can act on.
+ *
+ * The generic "could not determine the window underneath" this replaces is a
+ * dead end on Linux, where the two ways it fails have opposite fixes and
+ * neither is guessable: a Wayland session withholds window identity from
+ * applications outright, and an X11 session needs `xprop`/`xwininfo` present
+ * because that is what the enumerator shells out to.
+ *
+ * A session with both `WAYLAND_DISPLAY` and `DISPLAY` is Wayland running
+ * XWayland, where `xprop` can still answer — so it is treated as X11 and gets
+ * the tooling advice rather than being told to change session type.
+ */
+export function enumerationFailureNote(platform: string, env: NodeJS.ProcessEnv): string {
+  if (platform !== 'linux') {
+    return 'Could not enumerate windows on this system.'
+  }
+
+  // Hyprland is asked over its own IPC, so reaching here means the socket
+  // didn't answer — telling a Hyprland user to go and install xprop, or to
+  // abandon Wayland, would send them in exactly the wrong direction.
+  if (env.HYPRLAND_INSTANCE_SIGNATURE) {
+    return (
+      'Could not enumerate windows: Hyprland did not answer on its IPC socket. ' +
+      'Check that `hyprctl clients` works from the same session Hermes is ' +
+      'running in.'
+    )
+  }
+
+  const wayland = env.XDG_SESSION_TYPE === 'wayland' || (Boolean(env.WAYLAND_DISPLAY) && !env.DISPLAY)
+
+  if (wayland) {
+    return (
+      'Could not enumerate windows: this is a Wayland session, and Wayland does ' +
+      'not let an application see other applications\u2019 windows. Log in to an ' +
+      'X11/Xorg session, or run Hermes under XWayland with DISPLAY set.'
+    )
+  }
+
+  return (
+    'Could not enumerate windows: this needs the xprop and xwininfo commands ' +
+    '(the x11-utils package on Debian/Ubuntu, xorg-x11-utils on Fedora).'
+  )
 }
 
 const overlaps = (a: EnumeratedWindow['bounds'], b: EnumeratedWindow['bounds']): boolean =>
@@ -69,10 +128,39 @@ type GetWindowsModule = {
   >
 }
 
-let getWindowsModule: Promise<GetWindowsModule> | null = null
+let getWindowsModule: Promise<GetWindowsModule | null> | null = null
 
-const loadGetWindows = (): Promise<GetWindowsModule> => {
-  getWindowsModule ??= import('get-windows')
+const loadGetWindows = (): Promise<GetWindowsModule | null> => {
+  // get-windows is an optionalDependency: `npm ci` can skip it when its native
+  // install fails, including Linux and Windows ARM64 where 9.3.0 has no
+  // prebuilt. A missing module is therefore a normal state on those targets,
+  // so the lazy import resolves to null instead of rejecting; enumeration then
+  // degrades to the failure note instead of an uncaught error.
+  //
+  // The STAGED copy is tried first, and it is not a dev-only nicety.
+  // `import('get-windows')` resolves out of node_modules, whose lib/windows.js
+  // locates its binding through `preGyp.find()` — by HOST platform. When the
+  // tree was installed on a different OS than Electron is running on (a
+  // WSL-hosted dev run driving a win32 Electron is the everyday case here),
+  // pre-gyp picks the host's slot, ignores the win32 binding sitting beside it,
+  // and upstream's fail-soft path hands back no-op stubs. Enumeration then
+  // reports "unavailable" on a machine that answers perfectly well, which is
+  // what silently disabled both read_window_below and the HUD's game overlay.
+  // scripts/stage-native-deps.mjs writes a staged lib/windows.js that requires
+  // the binding directly, so it is the more reliable of the two everywhere.
+  getWindowsModule ??= (async () => {
+    const staged = path.join(app.getAppPath(), 'dist', 'node_modules', 'get-windows', 'index.js')
+
+    if (fs.existsSync(staged)) {
+      const mod = await import(pathToFileURL(staged).href).catch(() => null)
+
+      if (mod) {
+        return mod as GetWindowsModule
+      }
+    }
+
+    return import('get-windows').catch(() => null)
+  })()
 
   return getWindowsModule
 }
@@ -81,19 +169,22 @@ const loadGetWindows = (): Promise<GetWindowsModule> => {
  * Enumerate windows and serialize the one underneath `selfBounds`.
  *
  * `titlesAvailable` is the macOS Screen Recording grant (pass true on other
- * platforms, where titles are free). Returns null only when enumeration
- * itself is unavailable (Wayland, missing xprop, addon load failure) — the
- * caller turns that into an empty tool answer.
+ * platforms, where titles are free). When enumeration itself is unavailable
+ * (Wayland, missing xprop, addon load failure) this answers with the reason
+ * rather than nothing, so the agent can tell the user what to fix instead of
+ * reporting a blank failure.
  */
-export async function readWindowBelow(
-  selfPid: number,
-  selfBounds: EnumeratedWindow['bounds'],
-  titlesAvailable: boolean
-): Promise<WindowBelowResult | null> {
+async function enumerateViaGetWindows(titlesAvailable: boolean): Promise<EnumeratedWindow[] | null> {
   let raw
 
   try {
-    const { openWindows } = await loadGetWindows()
+    const getWindows = await loadGetWindows()
+
+    if (!getWindows) {
+      return null
+    }
+
+    const { openWindows } = getWindows
     raw = await openWindows(
       process.platform === 'darwin'
         ? { accessibilityPermission: false, screenRecordingPermission: titlesAvailable }
@@ -114,7 +205,7 @@ export async function readWindowBelow(
   // must be reversed to match. (Verified against get-windows 9.3.0.)
   const ordered = process.platform === 'linux' ? [...raw].reverse() : raw
 
-  const windows: EnumeratedWindow[] = ordered.map(w => ({
+  return ordered.map(w => ({
     app: w.owner?.name ?? '',
     bounds: {
       x: w.bounds?.x ?? 0,
@@ -126,6 +217,37 @@ export async function readWindowBelow(
     pid: w.owner?.processId ?? 0,
     title: w.title ?? ''
   }))
+}
+
+/**
+ * Front-to-back window enumeration, or null when the platform cannot answer.
+ *
+ * Hyprland first, and only ever on Hyprland — its own IPC sees native Wayland
+ * windows, which the X11 enumerator cannot, and it answers null everywhere
+ * else so the established path stays the default. Shared by the
+ * read_window_below tool and the HUD's game-overlay watch, so the two can
+ * never disagree about what the screen looks like.
+ */
+export async function enumerateWindowsFrontToBack(
+  selfPid: number,
+  titlesAvailable: boolean
+): Promise<EnumeratedWindow[] | null> {
+  return (await readHyprlandWindows(selfPid)) ?? (await enumerateViaGetWindows(titlesAvailable))
+}
+
+export async function readWindowBelow(
+  selfPid: number,
+  selfBounds: EnumeratedWindow['bounds'],
+  titlesAvailable: boolean
+): Promise<WindowBelowResult | WindowBelowUnavailable> {
+  const windows = await enumerateWindowsFrontToBack(selfPid, titlesAvailable)
+
+  if (!windows) {
+    return {
+      error: enumerationFailureNote(process.platform, process.env),
+      platform: process.platform
+    }
+  }
 
   const { below, frontmost } = pickWindowBelow(windows, selfPid, selfBounds)
 

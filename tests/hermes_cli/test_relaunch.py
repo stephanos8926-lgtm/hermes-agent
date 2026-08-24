@@ -114,13 +114,26 @@ class TestRelaunch:
 
         assert calls == [("/usr/bin/hermes", ["/usr/bin/hermes", "--resume", "abc"])]
 
+    @pytest.mark.windows_only
     def test_windows_uses_subprocess_not_execvp(self, monkeypatch):
         """On Windows, os.execvp raises OSError "Exec format error" when the
         target is a .cmd shim or console-script wrapper (both common for
         hermes).  relaunch() must detect win32 and use subprocess.run +
-        sys.exit instead."""
-        monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
+        sys.exit instead.
+
+        ``windows_only``: the bug is that ``os.execvp`` cannot exec a Windows
+        console-script shim. On Linux ``execvp`` works fine, so a patched
+        platform only re-asserted the branch we wrote, never the constraint
+        that motivated it.
+        """
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: r"C:\Users\test\hermes.exe")
+        # Pin sys.argv: relaunch() preserves inherited flags from the LIVE
+        # argv, so under pytest it happily inherited the runner's own
+        # "-m 'windows_only and not integration'" and the assertion below saw
+        # them in the child argv. Nothing to do with Windows — it only showed
+        # up here because this is the first lane that actually executes the
+        # test, and -m is how that lane selects it.
+        monkeypatch.setattr(relaunch_mod.sys, "argv", [r"C:\Users\test\hermes.exe"])
 
         import subprocess as _subprocess
 
@@ -150,9 +163,9 @@ class TestRelaunch:
         assert execvp_calls == []
         assert captured_argv == [[r"C:\Users\test\hermes.exe", "chat"]]
 
+    @pytest.mark.windows_only
     def test_windows_propagates_child_exit_code(self, monkeypatch):
         """A non-zero exit from the child should flow through to sys.exit."""
-        monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: r"C:\hermes.exe")
 
         import subprocess as _subprocess
@@ -176,8 +189,13 @@ class TestResolveHermesBinWindowsPyGuard:
     PATHEXT includes .py when the Python launcher is installed — but
     subprocess.run can't actually exec a .py directly, so the relaunch
     would fail with the cryptic "%1 is not a valid Win32 application" error.
+
+    The Windows cases are ``windows_only``: the PATHEXT-driven ``os.access``
+    result the guard defends against simply does not occur on POSIX, so a
+    faked ``sys.platform`` could never reproduce the hazard.
     """
 
+    @pytest.mark.windows_only
     def test_windows_rejects_py_argv0_falls_through_to_path(self, monkeypatch, tmp_path):
         """On Windows, if sys.argv[0] is a .py file, we must skip the
         argv[0] fast-path and fall through to PATH / python -m."""
@@ -185,7 +203,6 @@ class TestResolveHermesBinWindowsPyGuard:
         script = tmp_path / "main.py"
         script.write_text("# stub")
 
-        monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
         monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
         # Force PATH lookup to return a hermes.exe so the test doesn't
         # exercise the None-fallback path (that's a separate test).
@@ -198,47 +215,18 @@ class TestResolveHermesBinWindowsPyGuard:
         # Must NOT be the .py — must be the hermes.exe PATH entry.
         assert bin_path == r"C:\venv\Scripts\hermes.exe"
 
-    def test_posix_skips_py_argv0_falls_through_to_path(self, monkeypatch, tmp_path):
-        """POSIX safety: argv[0] pointing at a *Python-shebang* script must NOT
-        be returned as the bare exec target.
-
-        A bare ``env python3``/``python`` shebang is resolved from PATH at exec
-        time and can pick the system interpreter instead of the venv that owns
-        the running process (e.g. the ``~/.local/bin/hermes`` shim exec's
-        ``venv/bin/python <repo>/hermes`` with argv[0] = the repo script, and
-        relaunching that script directly drops the venv → imports like ``rich``
-        that only exist in the venv crash).  The safe targets are the ``hermes``
-        shim on PATH (which hardcodes the venv) or the ``sys.executable -m
-        hermes_cli.main`` fallback.  Degenerate posix case: the script is the
-        only hermes anywhere → fall through to PATH lookup / None.
-        """
-        if sys.platform == "win32":
-            pytest.skip("POSIX semantics")
+    @pytest.mark.linux_only
+    def test_posix_still_accepts_py_argv0(self, monkeypatch, tmp_path):
+        """POSIX behaviour unchanged: argv[0] pointing at an executable
+        script (including .py with a shebang + chmod +x) is fine to return
+        because POSIX exec can route through the shebang line."""
         script = tmp_path / "hermes"
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
-        # PATH provides a real hermes shim → must return that shim, NOT the script.
-        monkeypatch.setattr(
-            relaunch_mod.shutil, "which",
-            lambda name: "/home/sysop/.local/bin/hermes" if name == "hermes" else None,
-        )
-        assert relaunch_mod.resolve_hermes_bin() == "/home/sysop/.local/bin/hermes"
+        assert relaunch_mod.resolve_hermes_bin() == str(script)
 
-    def test_posix_py_argv0_with_no_hermes_on_path_returns_none(self, monkeypatch, tmp_path):
-        """Bulletproof fallback shared with the Windows .py case: when argv[0] is
-        a Python-shebang script AND no hermes entry point is on PATH, return None
-        so the caller uses ``sys.executable -m hermes_cli.main`` — the running
-        (correct) interpreter — rather than exec'ing the script through ``env``."""
-        if sys.platform == "win32":
-            pytest.skip("POSIX semantics")
-        script = tmp_path / "hermes"
-        script.write_text("#!/usr/bin/env python3\n")
-        script.chmod(0o755)
-        monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
-        monkeypatch.setattr(relaunch_mod.shutil, "which", lambda name: None)
-        assert relaunch_mod.resolve_hermes_bin() is None
-
+    @pytest.mark.windows_only
     def test_windows_py_argv0_with_no_hermes_on_path_returns_none(self, monkeypatch, tmp_path):
         """Bulletproof fallback: if argv0 is .py on Windows AND hermes.exe
         isn't on PATH, return None so the caller falls back to
@@ -246,7 +234,6 @@ class TestResolveHermesBinWindowsPyGuard:
         script = tmp_path / "main.py"
         script.write_text("# stub")
 
-        monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
         monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
         monkeypatch.setattr(relaunch_mod.shutil, "which", lambda name: None)
 

@@ -38,6 +38,23 @@ from agent.prompt_builder import (
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
+@pytest.fixture(autouse=True)
+def _drain_truncation_warnings():
+    """Leave no truncation warnings in the shared thread context.
+
+    Truncation warnings ride a ContextVar; under plain ``pytest`` (no
+    per-file subprocess isolation) anything this file records leaks into
+    later files' contexts and breaks their assertions/ordering.
+
+    Drain on both sides: before, so warnings leaked by earlier files can't
+    pollute this file's assertions, and after, so this file leaves the
+    ContextVar clean for later files.
+    """
+    drain_truncation_warnings()
+    yield
+    drain_truncation_warnings()
+
+
 # =========================================================================
 # Guidance constants
 # =========================================================================
@@ -515,6 +532,29 @@ class TestBuildContextFilesPrompt:
 
         assert _load_agents_md(sub) == ""
 
+    # --- AGENTS.override.md personal override (port of pi#7681) ---
+
+    def test_agents_override_md_wins_over_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.override.md").write_text("Use Black instead.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Use Black instead" in result
+        assert "Ruff for linting" not in result
+        assert "AGENTS.override.md" in result
+
+    def test_agents_override_md_loads_alone(self, tmp_path):
+        (tmp_path / "AGENTS.override.md").write_text("Override-only context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Override-only context" in result
+        assert "Project Context" in result
+
+    def test_hermes_md_still_wins_over_agents_override(self, tmp_path):
+        (tmp_path / ".hermes.md").write_text("Hermes-first context.")
+        (tmp_path / "AGENTS.override.md").write_text("Override context.")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Hermes-first context" in result
+        assert "Override context" not in result
+
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,
         # the desktop default) must not load that tree's contributor AGENTS.md
@@ -749,11 +789,14 @@ class TestEnvironmentHints:
 
 
     def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
-        """Docker/remote backends must hide host info — the agent can only touch the backend."""
+        """Docker/remote backends must hide host info — the agent can only touch the backend.
+
+        Host-independent: suppression is a property of the remote-backend
+        branch, so instead of faking a Windows host we assert no host line of
+        any kind is emitted.
+        """
         import agent.prompt_builder as _pb
-        import sys
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         # Force the probe to fail so we exercise the static fallback path
         # deterministically (the live probe would try to spin up docker).
@@ -761,7 +804,7 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()
         # Host suppression: none of the local-backend lines should appear.
-        assert "Host: Windows" not in result
+        assert "Host:" not in result
         assert "User home directory:" not in result
         assert "PowerShell" not in result
         # Backend info must appear instead.
@@ -959,6 +1002,51 @@ class TestOpenAIModelExecutionGuidance:
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+
+    def test_guidance_covers_external_write_readback(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "read" in text and "back" in text
+        assert "successful tool call is not a successful task" in text
+
+    def test_guidance_covers_count_reconciliation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "has_more" in text
+        assert "hard assertions" in text
+
+    def test_guidance_covers_literal_preservation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "normalize" in text
+        assert "malformed" in text
+
+    def test_guidance_covers_retry_differently(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "suspiciously narrow" in text
+        assert "retry" in text
+
+    def test_guidance_gates_completion_on_verification(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "plausible subset" in text
+
+
+class TestExecutionGuidanceModels:
+    """Behavior contracts for the default auto-match model list."""
+
+    def test_includes_historical_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gpt", "codex", "grok"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_includes_composio_eval_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_excludes_google_and_claude(self):
+        # Gemini/Gemma get GOOGLE_MODEL_OPERATIONAL_GUIDANCE instead;
+        # Claude doesn't exhibit the targeted failure modes.
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gemini", "gemma", "claude"):
+            assert fam not in EXECUTION_GUIDANCE_MODELS
 
 
 class TestParallelToolCallGuidance:
