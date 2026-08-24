@@ -434,6 +434,11 @@ class HonchoClientConfig:
     context_cadence: int = 1
     # Minimum turns between dialectic prefetch fires (supplement layer cadence)
     dialectic_cadence: int = 1
+    # KG context injection settings
+    kg_inject_enabled: bool = False
+    kg_inject_cadence: int = 5
+    kg_inject_max_entities: int = 15
+    kg_inject_max_depth: int = 1
     # Rewrite the latest user message into a retrieval query before dialectic.
     # Off by default: adds one auxiliary LLM call per dialectic fire
     # (model/timeout under auxiliary.memory_query_rewrite in config.yaml).
@@ -693,6 +698,27 @@ class HonchoClientConfig:
             dialectic_cadence=_parse_int_config(
                 host_block.get("dialecticCadence"),
                 raw.get("dialecticCadence"),
+                default=1,
+            ),
+            # KG context injection settings
+            kg_inject_enabled=_resolve_bool(
+                host_block.get("kgInjectEnabled"),
+                raw.get("kgInjectEnabled"),
+                default=False,
+            ),
+            kg_inject_cadence=_parse_int_config(
+                host_block.get("kgInjectCadence"),
+                raw.get("kgInjectCadence"),
+                default=5,
+            ),
+            kg_inject_max_entities=_parse_int_config(
+                host_block.get("kgInjectMaxEntities"),
+                raw.get("kgInjectMaxEntities"),
+                default=15,
+            ),
+            kg_inject_max_depth=_parse_int_config(
+                host_block.get("kgInjectMaxDepth"),
+                raw.get("kgInjectMaxDepth"),
                 default=1,
             ),
             query_rewrite=_resolve_bool(

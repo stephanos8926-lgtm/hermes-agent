@@ -298,6 +298,42 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Initialize the session eagerly in tools mode instead of on first tool call.",
             group="Recall",
         ),
+        # — Knowledge Graph Injection —
+        ProviderField(
+            key="kgInjectEnabled",
+            label="Inject KG context",
+            kind=KIND_BOOL,
+            default="false",
+            description="Inject Knowledge Graph peer entities + neighborhoods into context every N turns.",
+            group="Recall",
+        ),
+        ProviderField(
+            key="kgInjectCadence",
+            label="KG inject cadence",
+            kind=KIND_NUMBER,
+            default="5",
+            description="Minimum turns between KG context injections.",
+            placeholder="5",
+            group="Recall",
+        ),
+        ProviderField(
+            key="kgInjectMaxEntities",
+            label="KG max entities",
+            kind=KIND_NUMBER,
+            default="15",
+            description="Maximum peer entities to include in KG context dump.",
+            placeholder="15",
+            group="Recall",
+        ),
+        ProviderField(
+            key="kgInjectMaxDepth",
+            label="KG max depth",
+            kind=KIND_NUMBER,
+            default="1",
+            description="Neighborhood depth for KG context (0–3).",
+            placeholder="1",
+            group="Recall",
+        ),
         # — Limits —
         ProviderField(
             key="messageMaxChars",

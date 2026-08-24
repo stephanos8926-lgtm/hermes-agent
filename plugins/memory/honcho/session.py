@@ -7,6 +7,10 @@ import queue
 import re
 import logging
 import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING
@@ -193,6 +197,13 @@ class HonchoSessionManager:
         self._dialectic_max_input_chars: int = (
             config.dialectic_max_input_chars if config else 10000
         )
+
+        # KG context injection settings
+        self._kg_inject_enabled: bool = config.kg_inject_enabled if config else False
+        self._kg_inject_cadence: int = config.kg_inject_cadence if config else 5
+        self._kg_inject_max_entities: int = config.kg_inject_max_entities if config else 15
+        self._kg_inject_max_depth: int = config.kg_inject_max_depth if config else 1
+        self._kg_last_inject_turn: int = -999
 
         # Async write queue — the writer thread starts lazily on first enqueue
         # (see _ensure_async_writer). Constructing a manager must not spawn
@@ -999,7 +1010,102 @@ class HonchoSessionManager:
         except Exception as e:
             logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
 
+        # ----- Layer 3: Knowledge Graph context dump -----
+        # Inject peer entities + neighborhoods from the KG overlay every N turns.
+        if self._kg_inject_enabled and self._config:
+            kg_due = (
+                self._kg_inject_cadence <= 1
+                or (self._turn_counter - self._kg_last_inject_turn) >= self._kg_inject_cadence
+            )
+            if kg_due:
+                self._kg_last_inject_turn = self._turn_counter
+                kg_context = self._fetch_kg_context(session, user_message)
+                if kg_context:
+                    result["kg_context"] = kg_context
+
         return result
+
+    def _fetch_kg_context(self, session: "HonchoSession", user_message: str | None = None) -> str | None:
+        """
+        Fetch Knowledge Graph context dump from Honcho server.
+        
+        Calls GET /v3/workspaces/{workspace}/kg/context-dump with peer entities
+        and 1-hop neighborhoods, formatted for injection.
+        """
+        try:
+            base_url = getattr(self._config, "base_url", None) or ""
+            base_url = base_url.strip().rstrip("/")
+            if not base_url:
+                return None
+            
+            workspace = getattr(self._config, "workspace_id", None) or "hermes"
+            if workspace == "default":
+                workspace = "hermes"
+            
+            peer = getattr(self._config, "peer_name", None) or "sysop"
+            
+            params = {
+                "peer": peer,
+                "max_entities": str(self._kg_inject_max_entities),
+                "max_depth": str(self._kg_inject_max_depth),
+                "limit_per_entity": "10",
+            }
+            qs = urllib.parse.urlencode(params)
+            url = f"{base_url}/v3/workspaces/{urllib.parse.quote(workspace)}/kg/context-dump?{qs}"
+            
+            req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
+            api_key = getattr(self._config, "api_key", None)
+            if api_key and api_key not in (None, "", "local"):
+                req.add_header("Authorization", f"Bearer {api_key}")
+            
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            
+            # Format for injection
+            parts = ["## Knowledge Graph Context"]
+            
+            peer_entities = data.get("peer_entities", [])
+            if peer_entities:
+                entity_lines = []
+                for e in peer_entities:
+                    entity_lines.append(f"  - {e['name']} ({e['type']}, confidence: {e['confidence']:.2f})")
+                parts.append("### Peer Entities\n" + "\n".join(entity_lines))
+            
+            neighborhoods = data.get("neighborhoods", {})
+            if neighborhoods:
+                for entity_name, subgraph in neighborhoods.items():
+                    entities = subgraph.get("entities", [])
+                    relationships = subgraph.get("relationships", [])
+                    if entities or relationships:
+                        sub_parts = [f"#### {entity_name}"]
+                        if entities:
+                            ent_lines = [f"  - {e['name']} ({e['type']})" for e in entities[:10]]
+                            sub_parts.append("Entities:\n" + "\n".join(ent_lines))
+                        if relationships:
+                            rel_lines = [f"  - {r['source']} --{r['type']}--> {r['target']}" for r in relationships[:10]]
+                            sub_parts.append("Relationships:\n" + "\n".join(rel_lines))
+                        parts.append("\n".join(sub_parts))
+            
+            if len(parts) == 1:
+                return None
+            
+            token_estimate = data.get("token_estimate", 0)
+            if token_estimate:
+                parts.append(f"\n*KG context: ~{token_estimate} tokens*")
+            
+            return "\n\n".join(parts)
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                logger.debug("KG context-dump endpoint not found (Honcho server may be older version)")
+            else:
+                logger.debug("KG context-dump HTTP error %d: %s", e.code, e.reason)
+        except urllib.error.URLError as e:
+            logger.debug("KG context-dump connection error: %s", e)
+        except Exception as e:
+            logger.debug("Failed to fetch KG context: %s", e)
+        
+        return None
 
     def migrate_local_history(self, session_key: str, messages: list[dict[str, Any]]) -> bool:
         """

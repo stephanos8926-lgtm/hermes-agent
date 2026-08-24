@@ -198,17 +198,46 @@ class TestResolveHermesBinWindowsPyGuard:
         # Must NOT be the .py — must be the hermes.exe PATH entry.
         assert bin_path == r"C:\venv\Scripts\hermes.exe"
 
-    def test_posix_still_accepts_py_argv0(self, monkeypatch, tmp_path):
-        """POSIX behaviour unchanged: argv[0] pointing at an executable
-        script (including .py with a shebang + chmod +x) is fine to return
-        because POSIX exec can route through the shebang line."""
+    def test_posix_skips_py_argv0_falls_through_to_path(self, monkeypatch, tmp_path):
+        """POSIX safety: argv[0] pointing at a *Python-shebang* script must NOT
+        be returned as the bare exec target.
+
+        A bare ``env python3``/``python`` shebang is resolved from PATH at exec
+        time and can pick the system interpreter instead of the venv that owns
+        the running process (e.g. the ``~/.local/bin/hermes`` shim exec's
+        ``venv/bin/python <repo>/hermes`` with argv[0] = the repo script, and
+        relaunching that script directly drops the venv → imports like ``rich``
+        that only exist in the venv crash).  The safe targets are the ``hermes``
+        shim on PATH (which hardcodes the venv) or the ``sys.executable -m
+        hermes_cli.main`` fallback.  Degenerate posix case: the script is the
+        only hermes anywhere → fall through to PATH lookup / None.
+        """
         if sys.platform == "win32":
             pytest.skip("POSIX semantics")
         script = tmp_path / "hermes"
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
-        assert relaunch_mod.resolve_hermes_bin() == str(script)
+        # PATH provides a real hermes shim → must return that shim, NOT the script.
+        monkeypatch.setattr(
+            relaunch_mod.shutil, "which",
+            lambda name: "/home/sysop/.local/bin/hermes" if name == "hermes" else None,
+        )
+        assert relaunch_mod.resolve_hermes_bin() == "/home/sysop/.local/bin/hermes"
+
+    def test_posix_py_argv0_with_no_hermes_on_path_returns_none(self, monkeypatch, tmp_path):
+        """Bulletproof fallback shared with the Windows .py case: when argv[0] is
+        a Python-shebang script AND no hermes entry point is on PATH, return None
+        so the caller uses ``sys.executable -m hermes_cli.main`` — the running
+        (correct) interpreter — rather than exec'ing the script through ``env``."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX semantics")
+        script = tmp_path / "hermes"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script), "chat"])
+        monkeypatch.setattr(relaunch_mod.shutil, "which", lambda name: None)
+        assert relaunch_mod.resolve_hermes_bin() is None
 
     def test_windows_py_argv0_with_no_hermes_on_path_returns_none(self, monkeypatch, tmp_path):
         """Bulletproof fallback: if argv0 is .py on Windows AND hermes.exe
