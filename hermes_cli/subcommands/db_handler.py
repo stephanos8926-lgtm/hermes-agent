@@ -201,6 +201,65 @@ def _stats_lcm(hermes_home: Path) -> Dict[str, Any]:
         return {"exists": True, "error": f"{type(exc).__name__}: {exc}", "path": str(lcm)}
 
 
+def _print_wal_advisory(stats: Dict[str, Any], db_path: Path) -> None:
+    """Print a one-line advisory when the WAL is suspiciously large.
+
+    The advisory fires under two independent conditions:
+
+      1. Absolute: wal_size_bytes >= 100 MiB (regardless of db size)
+      2. Relative: wal_size_bytes > 50% of the database logical size
+         (the WAL has outgrown the database it shadows)
+
+    Both conditions suggest the WAL is not being checkpointed often
+    enough, which can mean:
+      * A long-running write transaction is preventing checkpoint
+      * The auto-checkpoint threshold (database.wal_autocheckpoint)
+        is set too high
+      * The gateway has been writing aggressively without a passive
+        checkpoint opportunity
+
+    The recommended remedy is hermes db vacuum which runs
+    PRAGMA wal_checkpoint(TRUNCATE) + VACUUM. The advisory is a hint,
+    not an error: the user can ignore it if they know the workload
+    is bursty and the WAL will shrink naturally.
+    """
+    wal = stats.get("wal_size_bytes")
+    if wal is None or wal == 0:
+        return  # No WAL sidecar or stat() failed - nothing to advise
+    # Absolute threshold: 100 MiB
+    WAL_ABSOLUTE_THRESHOLD = 100 * 1024 * 1024
+    # Relative threshold: WAL > 50% of logical db size
+    WAL_RELATIVE_RATIO = 0.5
+
+    absolute = wal >= WAL_ABSOLUTE_THRESHOLD
+    logical = stats.get("logical_size_bytes")
+    relative = (
+        logical is not None
+        and logical > 0
+        and wal > logical * WAL_RELATIVE_RATIO
+    )
+    if not (absolute or relative):
+        return
+
+    rel_str = ""
+    if relative and logical:
+        pct = wal * 100 / logical
+        rel_str = f" ({pct:.0f}% of {logical:,d} byte db)"
+    abs_str = f"{wal:,d} bytes"
+    reasons = []
+    if absolute:
+        reasons.append(">= 100 MiB")
+    if relative:
+        reasons.append("> 50% of db size")
+    reason_str = ", ".join(reasons)
+    target_name = db_path.name if db_path else "state.db"
+    print(
+        f"  advisory: wal_size_bytes is {abs_str}{rel_str}; "
+        f"recommend hermes db vacuum {target_name} ({reason_str})",
+        file=sys.stderr,
+    )
+
+
 def run_db_action(
     *,
     action: str,
@@ -257,12 +316,14 @@ def run_db_action(
         print(f"stats for {db_path}:")
         for k, v in stats.items():
             print(f"  {k}: {v}")
+        _print_wal_advisory(stats, db_path)
         if include_lcm:
             print()
             lcm_stats = _stats_lcm(hermes_home)
             print(f"stats for lcm.db:")
             for k, v in lcm_stats.items():
                 print(f"  {k}: {v}")
+            _print_wal_advisory(lcm_stats, hermes_home / "plugins" / "hermes-lcm" / "lcm.db")
         return 0
 
     if action == "vacuum":
