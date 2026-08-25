@@ -5293,6 +5293,8 @@ def run_conversation(
                                     new_ctx=_reduced_ctx, old_ctx=old_ctx
                                 )
                             )
+                            # D2 deferral: time.sleep(2) blocks the turn
+                            # thread. See docs/optimization/d2-deferral-record.md.
                             time.sleep(2)
                             _retry.restart_with_compressed_messages = True
                             break
@@ -5596,6 +5598,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        # D2 deferral: see docs/optimization/d2-deferral-record.md
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -5902,6 +5905,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        # D2 deferral: see docs/optimization/d2-deferral-record.md
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
