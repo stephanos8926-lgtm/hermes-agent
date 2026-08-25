@@ -1,72 +1,105 @@
 ---
 name: hermes-db
-description: Inspect, validate, and maintain Hermes sqlite databases (state.db, lcm.db, kanban).
+category: devops
+description: SQLite maintenance CLI for the Hermes agent runtime. Use when running integrity checks, VACUUM, or schema repair on state.db / lcm.db.
+keywords: [sqlite, integrity_check, vacuum, state.db, lcm.db, fts, wal, hermes db, repair, schema, migration]
+triggers:
+  - "hermes db"
+  - "hermes db check"
+  - "hermes db vacuum"
+  - "hermes db repair"
+  - "hermes db stats"
+  - "hermes db list"
 version: 1.0.0
-author: RapidWebs + Hermes Agent
-license: MIT
-platforms: [linux, macos]
-metadata:
-  hermes:
-    tags: [sqlite, maintenance, vacuum, integrity, hermes-cli]
-    category: devops
-    requires_toolsets: [cli]
-    commands: [hermes db]
-environments:
-  - cli
 ---
 
-# Hermes DB Skill
+# hermes db — SQLite Maintenance CLI
 
-Surface-level operational guide for the `hermes db` CLI subcommand group. The skill teaches the agent when to use each action and how to interpret the output. The actual implementation lives in `hermes_cli/subcommands/db.py` and `hermes_cli/subcommands/db_handler.py` — this skill is documentation and decision support, not a separate runtime.
+Surfaced from existing `hermes_state.py` primitives (`repair_state_db_schema`,
+`quarantine_zeroed_state_db`, `collect_state_db_stats`) plus a local LCM-DB
+integrity check. Read-only by default; explicit opt-in for write actions.
 
-## When to Use
+## When to Use This Skill
 
-Use this skill when **any** of the following are true:
+- state.db has grown past 1 GB and needs VACUUM
+- lcm.db needs an integrity check after a crash
+- A migration failed and you need to repair the schema
+- You want a stats snapshot before/after a cleanup
+- You want to enumerate all known sqlite databases
 
-- The user asks about state.db corruption, WAL growth, or "why is my sessions.db huge"
-- The user wants to know how to vacuum / reindex / optimize the LCM store
-- The agent itself is exhibiting symptoms of a corrupt state.db (lost sessions, weird errors, repeated restarts)
-- A scheduled maintenance job is being set up and needs a `hermes db` invocation
-- The user asks "what databases does hermes use"
+## Quick Reference
 
-Do **not** use this skill for general sqlite questions unrelated to Hermes databases. The skill is scoped to the Hermes-specific databases and their schema quirks.
+```bash
+hermes db check                 # integrity_check + quick_check (read-only)
+hermes db check --lcm           # also probe the LCM context store
+hermes db stats                 # page count, WAL size, FTS presence, etc.
+hermes db vacuum                # wal_checkpoint(TRUNCATE) + VACUUM
+hermes db repair                # full schema repair (writes)
+hermes db list                  # enumerate known databases
+```
 
-## Commands
+## Decision Tree
 
-| Action | Read-only? | Purpose |
-|--------|-----------|---------|
-| `hermes db list` | yes | Enumerate every known Hermes sqlite database with size and mtime |
-| `hermes db check [target]` | yes | Run `PRAGMA integrity_check` + `quick_check` against the target DB |
-| `hermes db stats [target]` | yes | Page count, WAL size, row counts, FTS presence, journal mode |
-| `hermes db vacuum [target]` | **mutating** | `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM` (reclaims space) |
-| `hermes db repair [target]` | **mutating** | For state.db, calls the existing `repair_state_db_schema` zeroed-DB recovery path |
+| Symptom | Action |
+|---------|--------|
+| state.db > 1 GB | `hermes db vacuum` |
+| Crashed during write | `hermes db check state.db` → `hermes db repair` if not OK |
+| Migration failed | `hermes db repair state.db` (with --no-backup for dev) |
+| LCM store corrupted | `hermes db check --lcm` |
+| Just want a snapshot | `hermes db stats` |
+| Don't know what's there | `hermes db list` |
 
-The optional `[target]` argument is one of: `state.db` (default), `lcm.db`, `kanban`. The `--lcm` flag extends `check` / `stats` to also probe the LCM context store (~/.hermes/plugins/hermes-lcm/lcm.db). The `--no-backup` flag on `repair` skips the safety backup that the action takes by default.
+## Action Details
 
-## Workflow
+### `check`
 
-When asked to investigate a database issue:
+Read-only. Runs `PRAGMA integrity_check` (the gold-standard verifier) plus
+`PRAGMA quick_check` (faster heuristic). Safe against a live database held
+by the gateway. Use this first; only escalate to `repair` if `check` reports
+an issue.
 
-1. **Read-only first.** Start with `hermes db list` to see what's there, then `hermes db check state.db` to verify integrity. Never jump to a mutating action without first understanding the state.
-2. **WAL bloat.** A multi-gigabyte WAL is the most common "the db is huge" complaint. Run `hermes db stats state.db` to see the journal mode and WAL size. If WAL is large, run `hermes db vacuum state.db` to checkpoint + truncate.
-3. **Corruption symptoms.** If the user reports sessions disappearing, crashes mid-write, or "sqlite3.DatabaseError: database disk image is malformed", the path is `check` → `repair`. The `repair` action is safe-by-default: it makes a backup before any write.
-4. **LCM store.** The LCM context store is separate from state.db and has its own schema. Use the `--lcm` flag to extend `check` / `stats` to include it. A standalone LCM `repair` is **not** implemented — fall through to the integrity check + manual `vacuum` for now.
-5. **Scheduled jobs.** For cron-style invocation, the read-only actions are safe to run at any time. `vacuum` and `repair` should be run during low-traffic windows (e.g., `on_session_end` from a `disk-cleanup` plugin, or a `cron` schedule outside the user's working hours).
+### `stats`
 
-## Output interpretation
+Calls `collect_state_db_stats()` for `state.db` or the local equivalent
+for `lcm.db`. Returns page count, WAL size, row counts, FTS presence,
+and journal mode. Use before/after a `vacuum` to verify the gain.
 
-- `hermes db check` returns one of `ok`, `ok` (with warnings), or a multi-line report of the integrity issues found. A clean `ok` is the expected result.
-- `hermes db stats` returns a JSON-shaped block with `pages`, `page_size`, `wal_size_bytes`, `journal_mode`, and per-table row counts. The two numbers to watch are `wal_size_bytes` (if this is much larger than `pages × page_size`, vacuum will reclaim a lot) and any zero-row tables that you expect to have data in.
-- `hermes db list` returns one line per database: path, size in bytes, mtime. Use this to spot databases that have grown unexpectedly or that haven't been touched in weeks (the latter may be a sign of a broken plugin).
+### `vacuum`
 
-## Non-goals
+The expensive action. Runs `PRAGMA wal_checkpoint(TRUNCATE)` first to
+collapse the WAL, then `VACUUM` to rebuild the database. May take
+minutes on multi-GB databases. Only call manually or from a scheduled job.
 
-This skill is intentionally narrow:
+### `repair`
 
-- It does **not** teach the agent how to interpret Hermes state.db schema details — that's a separate skill (`hermes-state-inspector` if/when it exists).
-- It does **not** include the disk-cleanup plugin's vacuum integration — that lives in the plugin's own `on_session_end` hook and is documented there.
-- It does **not** cover the LCM `quarantine` or `deferral` features — those are LCM-plugin-specific and out of scope.
+Writes. For `state.db`, uses `repair_state_db_schema` (full schema repair
+with a `repair_state_db_schema_locked` cross-process lock to prevent
+concurrent gateway writes). For other targets, runs `check` first and
+only proceeds to a `vacuum` if needed. With `--no-backup`, skips the
+pre-repair backup (use only in dev).
 
-## Feature gating
+### `list`
 
-All cache subcommand behavior is feature-gated by the `cache:` block in `~/.hermes/config.yaml` (with `HERMES_CACHE_*` env-var overrides) — see `agent/_cache.py`. The `hermes db` subcommand itself is **not** feature-gated: it is a maintenance tool, and the user invoking it is the feature gate.
+Enumerates all known sqlite databases: `state.db`, `kanban.db`,
+`plugins/hermes-lcm/lcm.db`. Returns path, size, and last-modified time.
+
+## What `hermes db` Does NOT Do
+
+- **Migrate schemas.** Schema migration is a separate concern, handled by
+  the migration runner in `hermes_state.py`. Use the migration runner for
+  schema version bumps.
+- **Repair *the gateway's in-memory state*.** If the gateway has a
+  corrupted in-memory session, restart it. `hermes db` operates on
+  persistent storage only.
+- **Tune sqlite parameters.** This CLI uses safe defaults. For
+  performance tuning (e.g. `cache_size`, `mmap_size`), edit
+  `hermes_state.py` directly with a maintainer's review.
+
+## See Also
+
+- `skills/devops/hermes-cache/SKILL.md` — companion skill for the
+  tiered cache subsystem, uses the same config-driven feature-gate
+  pattern.
+- `plugins/disk-cleanup/` — handles file-system hygiene around the
+  sqlite files; v3.1.0+ has a `vacuum-dbs` slash subcommand that wires
+  this CLI into the on_session_end hook.
