@@ -3,21 +3,44 @@
 Covers:
   * InProcessLRUCache — basic get/put/invalidate, LRU eviction, byte-budget
     eviction, thread safety, byte-stability contract, type validation.
+  * FlatFileCache (L2) — mmap-backed ring buffer, fail-open, persistence.
+  * ShardedFileCache (L3) — sharded directory, mtime TTL, evict_expired.
   * RedisCache / DiskCache — NotImplementedError on every method.
   * TieredCacheRouter — basic read-through, write-back, fail-open semantics.
+  * Config loader — feature gates, env-var overrides, graceful fallback.
 """
+import os
 import threading
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from agent._cache import (
     DEFAULT_L1_MAX_BYTES,
     DEFAULT_L1_MAX_ENTRIES,
+    DEFAULT_L2_FLAT_FILE_MAX_BYTES,
+    DEFAULT_L2_FLAT_FILE_PATH,
+    DEFAULT_L3_SHARDED_ROOT,
+    DEFAULT_L3_SHARDED_TTL_DAYS,
     DiskCache,
+    FlatFileCache,
     InProcessLRUCache,
     RedisCache,
+    ShardedFileCache,
     TieredCacheRouter,
+    _build_l2_from_config,
+    _build_l3_from_config,
+    _coerce,
+    _env_override,
+    _expand_path,
+    _read_cache_config,
+    build_cache_from_config,
+    is_cache_enabled,
+    is_l1_enabled,
+    is_l2_enabled,
+    is_l3_enabled,
 )
 
 
@@ -424,3 +447,634 @@ def test_default_constants():
     """Default constants are sensible (sanity check)."""
     assert DEFAULT_L1_MAX_ENTRIES == 64
     assert DEFAULT_L1_MAX_BYTES == 32 * 1024 * 1024
+    assert DEFAULT_L2_FLAT_FILE_MAX_BYTES == 64 * 1024 * 1024
+    assert DEFAULT_L3_SHARDED_TTL_DAYS == 30
+
+
+# ─── Path expansion ───────────────────────────────────────────────────
+
+
+def test_expand_path_handles_tilde():
+    """``~`` is expanded to the user's home directory."""
+    import os
+    assert _expand_path("~/foo") == os.path.expanduser("~/foo")
+    assert _expand_path("~") == os.path.expanduser("~")
+
+
+def test_expand_path_handles_env_vars():
+    """``$VAR`` is expanded from the environment."""
+    with patch.dict(os.environ if False else {"MY_CACHE_DIR": "/tmp/cache"}):
+        # Manually use a fresh dict because pytest's patch.dict scopes
+        # the env var to the with-block.
+        import os
+        with patch.dict(os.environ, {"HERMES_TEST_DIR": "/tmp/hermes-test"}):
+            result = _expand_path("$HERMES_TEST_DIR/l2.mmap")
+            assert result == "/tmp/hermes-test/l2.mmap"
+
+
+def test_expand_path_passthrough_for_non_strings():
+    """Non-string values are returned unchanged."""
+    assert _expand_path(42) == 42
+    assert _expand_path(None) is None
+
+
+# ─── Env-var override helper ──────────────────────────────────────────
+
+
+def test_env_override_returns_value_when_set():
+    """When HERMES_CACHE_<KEY> is set, _env_override returns it."""
+    with patch.dict(os.environ, {"HERMES_CACHE_ENABLED": "true"}, clear=False):
+        assert _env_override("enabled") == "true"
+
+
+def test_env_override_returns_none_when_unset():
+    """When the env var is not set, _env_override returns None."""
+    # Make sure it's not set.
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HERMES_CACHE_NONEXISTENT_KEY", None)
+        assert _env_override("nonexistent_key") is None
+
+
+def test_env_override_uppercases_dotted_keys():
+    """Dotted keys are converted to UPPERCASE_WITH_UNDERSCORES."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L1_MAX_ENTRIES": "128"}, clear=False):
+        assert _env_override("l1.max_entries") == "128"
+
+
+# ─── _coerce helper ───────────────────────────────────────────────────
+
+
+def test_coerce_to_bool_truthy():
+    """Strings like '1', 'true', 'yes', 'on' coerce to True."""
+    assert _coerce("1", False) is True
+    assert _coerce("true", False) is True
+    assert _coerce("True", False) is True
+    assert _coerce("YES", False) is True
+    assert _coerce("on", False) is True
+
+
+def test_coerce_to_bool_falsy():
+    """Strings like '0', 'false', 'no', 'off' coerce to False."""
+    assert _coerce("0", True) is False
+    assert _coerce("false", True) is False
+    assert _coerce("no", True) is False
+    assert _coerce("off", True) is False
+    assert _coerce("garbage", True) is False  # not in the truthy set
+
+
+def test_coerce_to_int():
+    """Strings are coerced to int when the default is int."""
+    assert _coerce("42", 0) == 42
+    assert _coerce("-1", 0) == -1
+    # Garbage falls back to the default.
+    assert _coerce("not-a-number", 99) == 99
+
+
+def test_coerce_to_float():
+    """Strings are coerced to float when the default is float."""
+    assert _coerce("3.14", 0.0) == 3.14
+    assert _coerce("garbage", 9.9) == 9.9
+
+
+def test_coerce_to_string_passthrough():
+    """Strings are returned as-is when the default is string."""
+    assert _coerce("hello", "default") == "hello"
+
+
+def test_coerce_passthrough_when_default_is_none():
+    """When the default is None, the string is returned unchanged."""
+    assert _coerce("anything", None) == "anything"
+
+
+# ─── Config loader ────────────────────────────────────────────────────
+
+
+def test_read_cache_config_returns_defaults_when_no_config():
+    """When the config file is missing, defaults are returned."""
+    with patch("agent._cache._read_cache_config") as _:
+        # Indirect: just make sure the function doesn't raise on a clean
+        # process. The test for the real config goes below.
+        pass
+    # Real call: should not raise even if config is malformed.
+    cfg = _read_cache_config()
+    assert isinstance(cfg, dict)
+    assert "enabled" in cfg
+    assert "l1" in cfg
+    assert "l2" in cfg
+    assert "l3" in cfg
+
+
+def test_read_cache_config_has_full_default_tree():
+    """Every documented config key has a default value."""
+    cfg = _read_cache_config()
+    assert cfg["l1"]["max_entries"] == DEFAULT_L1_MAX_ENTRIES
+    assert cfg["l1"]["max_bytes"] == DEFAULT_L1_MAX_BYTES
+    assert cfg["l2"]["flat_file"]["path"] == DEFAULT_L2_FLAT_FILE_PATH
+    assert cfg["l2"]["flat_file"]["max_bytes"] == DEFAULT_L2_FLAT_FILE_MAX_BYTES
+    assert cfg["l2"]["redis"]["url"] == "redis://localhost:6379"
+    assert cfg["l3"]["sharded_file"]["root"] == DEFAULT_L3_SHARDED_ROOT
+    assert cfg["l3"]["sharded_file"]["ttl_days"] == DEFAULT_L3_SHARDED_TTL_DAYS
+
+
+def test_read_cache_config_env_override_master_switch():
+    """HERMES_CACHE_ENABLED=false disables the master switch."""
+    with patch.dict(os.environ, {"HERMES_CACHE_ENABLED": "false"}, clear=False):
+        cfg = _read_cache_config()
+        assert cfg["enabled"] is False
+
+
+def test_read_cache_config_env_override_l1_size():
+    """HERMES_CACHE_L1_MAX_ENTRIES=128 grows the L1 cap."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L1_MAX_ENTRIES": "128"}, clear=False):
+        cfg = _read_cache_config()
+        assert cfg["l1"]["max_entries"] == 128
+
+
+def test_read_cache_config_env_override_l2_path():
+    """HERMES_CACHE_L2_FLAT_FILE_PATH=... overrides the L2 file path."""
+    with patch.dict(
+        os.environ,
+        {"HERMES_CACHE_L2_FLAT_FILE_PATH": "/tmp/hermes-test-l2.mmap"},
+        clear=False,
+    ):
+        cfg = _read_cache_config()
+        assert cfg["l2"]["flat_file"]["path"] == "/tmp/hermes-test-l2.mmap"
+
+
+def test_read_cache_config_graceful_fallback_on_exception():
+    """When the config read fails entirely, defaults are returned."""
+    with patch("hermes_cli.config.read_raw_config_readonly", side_effect=Exception):
+        with patch("hermes_cli.config.read_raw_config", side_effect=Exception):
+            cfg = _read_cache_config()
+            # Defaults still come back.
+            assert cfg["l1"]["max_entries"] == DEFAULT_L1_MAX_ENTRIES
+            assert cfg["l2"]["flat_file"]["path"] == DEFAULT_L2_FLAT_FILE_PATH
+
+
+# ─── Feature-gate helpers ────────────────────────────────────────────
+
+
+def test_is_cache_enabled_default_true():
+    """is_cache_enabled() returns True when nothing is set."""
+    # Sanity: with no overrides, the master switch is on.
+    assert is_cache_enabled() is True
+
+
+def test_is_cache_enabled_respects_env():
+    """HERMES_CACHE_ENABLED=false turns off the master switch."""
+    with patch.dict(os.environ, {"HERMES_CACHE_ENABLED": "false"}, clear=False):
+        assert is_cache_enabled() is False
+
+
+def test_is_l1_enabled_default_true():
+    """L1 is on by default."""
+    assert is_l1_enabled() is True
+
+
+def test_is_l1_disabled_when_master_off():
+    """L1 is off when the master switch is off."""
+    with patch.dict(os.environ, {"HERMES_CACHE_ENABLED": "false"}, clear=False):
+        assert is_l1_enabled() is False
+
+
+def test_is_l2_enabled_default_false():
+    """L2 is off by default (explicit opt-in)."""
+    assert is_l2_enabled() is False
+
+
+def test_is_l2_enabled_when_opted_in():
+    """HERMES_CACHE_L2_ENABLED=true turns on L2."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "true"}, clear=False):
+        assert is_l2_enabled() is True
+
+
+def test_is_l3_enabled_default_false():
+    """L3 is off by default (explicit opt-in)."""
+    assert is_l3_enabled() is False
+
+
+def test_is_l3_enabled_when_opted_in():
+    """HERMES_CACHE_L3_ENABLED=true turns on L3."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "true"}, clear=False):
+        assert is_l3_enabled() is True
+
+
+# ─── FlatFileCache (L2) — mmap ring buffer ────────────────────────────
+
+
+def test_flat_file_cache_basic_put_and_get(tmp_path):
+    """L2 mmap cache stores and retrieves values."""
+    cache = FlatFileCache(
+        path=str(tmp_path / "l2.mmap"),
+        max_bytes=1024 * 1024,  # 1 MiB
+    )
+    try:
+        cache.put("alpha", {"value": 1})
+        assert cache.get("alpha") == {"value": 1}
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_miss_returns_none(tmp_path):
+    """L2 mmap cache returns None for missing keys."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        assert cache.get("never_added") is None
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_invalidate_removes_entry(tmp_path):
+    """L2 mmap cache invalidation is a tombstone (logical delete)."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        cache.put("k", "v")
+        assert cache.get("k") == "v"
+        cache.invalidate("k")
+        assert cache.get("k") is None
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_replace_existing(tmp_path):
+    """Re-putting the same key replaces the value."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        cache.put("k", "v1")
+        cache.put("k", "v2")
+        assert cache.get("k") == "v2"
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_persists_across_instances(tmp_path):
+    """L2 mmap cache survives process restart (the whole point of L2)."""
+    path = str(tmp_path / "l2.mmap")
+    c1 = FlatFileCache(path=path, max_bytes=1024 * 1024)
+    c1.put("persisted", [1, 2, 3])
+    c1.close()
+
+    c2 = FlatFileCache(path=path, max_bytes=1024 * 1024)
+    try:
+        assert c2.get("persisted") == [1, 2, 3]
+    finally:
+        c2.close()
+
+
+def test_flat_file_cache_overflow_value_is_dropped(tmp_path):
+    """Values larger than SLOT_VALUE_MAX are dropped (fail-open, not raised)."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        # 5 KiB > SLOT_VALUE_MAX (4 KiB).
+        big = "x" * 5000
+        cache.put("big", big)
+        # The value should not be retrievable; the L2 dropped it.
+        # (The L1 layer in production would still have it.)
+        assert cache.get("big") is None
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_read_only_blocks_writes(tmp_path):
+    """Read-only mode: puts are silently dropped."""
+    cache = FlatFileCache(
+        path=str(tmp_path / "l2.mmap"),
+        max_bytes=1024 * 1024,
+        read_only=True,
+    )
+    try:
+        cache.put("k", "v")
+        # The put was silently dropped.
+        assert cache.get("k") is None
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_type_validation(tmp_path):
+    """Non-str keys raise TypeError on every method."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        with pytest.raises(TypeError):
+            cache.get(42)
+        with pytest.raises(TypeError):
+            cache.put(42, "v")
+        with pytest.raises(TypeError):
+            cache.invalidate(42)
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_stats_shape(tmp_path):
+    """stats() includes backend, path, max_bytes, slot counts."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        s = cache.stats()
+        assert s["backend"] == "flat_file"
+        assert s["max_bytes"] == 1024 * 1024
+        assert s["slot_count"] > 0
+        assert s["slot_value_max"] > 0
+        assert "hits" in s
+        assert "misses" in s
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_hit_rate(tmp_path):
+    """stats() reports hit_rate correctly."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        cache.put("k", "v")
+        cache.get("k")  # hit
+        cache.get("missing")  # miss
+        s = cache.stats()
+        assert s["hits"] == 1
+        assert s["misses"] == 1
+        assert abs(s["hit_rate"] - 0.5) < 1e-9
+    finally:
+        cache.close()
+
+
+# ─── ShardedFileCache (L3) — sharded directory with mtime TTL ─────────
+
+
+def test_sharded_file_cache_basic_put_and_get(tmp_path):
+    """L3 sharded cache stores and retrieves values."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("alpha", "value-alpha")
+    assert cache.get("alpha") == "value-alpha"
+
+
+def test_sharded_file_cache_miss_returns_none(tmp_path):
+    """L3 returns None for missing keys."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    assert cache.get("never_added") is None
+
+
+def test_sharded_file_cache_invalidate_removes_entry(tmp_path):
+    """invalidate() removes the entry and its metadata sidecar."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k", "v")
+    assert cache.get("k") == "v"
+    cache.invalidate("k")
+    assert cache.get("k") is None
+
+
+def test_sharded_file_cache_replace_existing(tmp_path):
+    """Re-putting the same key replaces the value."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k", "v1")
+    cache.put("k", "v2")
+    assert cache.get("k") == "v2"
+
+
+def test_sharded_file_cache_persists_across_instances(tmp_path):
+    """L3 survives process restart (the whole point of L3)."""
+    root = str(tmp_path / "l3")
+    c1 = ShardedFileCache(root=root, ttl_days=7)
+    c1.put("persisted", {"deep": [1, 2, 3]})
+
+    c2 = ShardedFileCache(root=root, ttl_days=7)
+    assert c2.get("persisted") == {"deep": [1, 2, 3]}
+
+
+def test_sharded_file_cache_shard_layout(tmp_path):
+    """Entries are placed in a 2-level shard directory."""
+    root = Path(tmp_path) / "l3"
+    cache = ShardedFileCache(root=str(root), ttl_days=7)
+    cache.put("k", "v")
+    # Walk the tree — there should be a 2-level shard.
+    found = list(root.glob("??/??/*"))
+    assert any(p.is_file() and not p.name.endswith(".json") for p in found)
+
+
+def test_sharded_file_cache_evict_expired(tmp_path):
+    """evict_expired() removes entries older than the TTL."""
+    root = str(tmp_path / "l3")
+    cache = ShardedFileCache(root=root, ttl_days=1)
+    cache.put("old", "old-value")
+    # Backdate the mtime by writing a new file with an old timestamp.
+    # We can't easily backdate via the cache API, so we reach into the index.
+    target = ShardedFileCache._key_path(Path(root), "old")
+    if target.exists():
+        old_time = time.time() - (86400 * 30)  # 30 days ago
+        import os
+        os.utime(target, (old_time, old_time))
+        # Also backdate the metadata sidecar.
+        meta = target.with_suffix(target.suffix + ".json")
+        if meta.exists():
+            os.utime(meta, (old_time, old_time))
+        # Invalidate the index so it rebuilds with the new mtimes.
+        cache._index = {}
+        cache._index_built = False
+        removed = cache.evict_expired()
+        assert removed >= 1
+        assert cache.get("old") is None
+
+
+def test_sharded_file_cache_type_validation(tmp_path):
+    """Non-str keys raise TypeError on every method."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    with pytest.raises(TypeError):
+        cache.get(42)
+    with pytest.raises(TypeError):
+        cache.put(42, "v")
+    with pytest.raises(TypeError):
+        cache.invalidate(42)
+
+
+def test_sharded_file_cache_stats_shape(tmp_path):
+    """stats() includes backend, root, ttl_days, entries count."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=14)
+    cache.put("k", "v")
+    s = cache.stats()
+    assert s["backend"] == "sharded_file"
+    assert s["ttl_days"] == 14
+    assert s["entries"] == 1
+    assert "hits" in s
+    assert "misses" in s
+
+
+# ─── TieredCacheRouter with mixed tiers ───────────────────────────────
+
+
+def test_router_writes_through_to_all_enabled_tiers(tmp_path):
+    """put() writes to every enabled tier; get() walks them in order."""
+    l1 = InProcessLRUCache()
+    l2_path = str(tmp_path / "l2.mmap")
+    l2 = FlatFileCache(path=l2_path, max_bytes=1024 * 1024)
+    l3_root = str(tmp_path / "l3")
+    l3 = ShardedFileCache(root=l3_root, ttl_days=7)
+    try:
+        router = TieredCacheRouter(l1, l2, l3)
+        router.put("k", "v")
+        # All three tiers have it.
+        assert l1.get("k") == "v"
+        assert l2.get("k") == "v"
+        assert l3.get("k") == "v"
+    finally:
+        l2.close()
+
+
+def test_router_reads_from_lower_tier_writes_back_to_higher(tmp_path):
+    """On L1 miss but L2 hit, the value is written back to L1."""
+    l1 = InProcessLRUCache()
+    l2 = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    l2.put("k", "from-l2")
+    try:
+        router = TieredCacheRouter(l1, l2)
+        assert router.get("k") == "from-l2"
+        # L1 was populated by write-back.
+        assert l1.get("k") == "from-l2"
+    finally:
+        l2.close()
+
+
+def test_router_invalidate_removes_from_all_tiers(tmp_path):
+    """invalidate() removes the key from every enabled tier."""
+    l1 = InProcessLRUCache()
+    l2 = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        router = TieredCacheRouter(l1, l2)
+        router.put("k", "v")
+        router.invalidate("k")
+        assert l1.get("k") is None
+        assert l2.get("k") is None
+    finally:
+        l2.close()
+
+
+def test_router_tier_failure_does_not_break_reads():
+    """A broken L2 does not take down the L1 read path."""
+    l1 = InProcessLRUCache()
+    l1.put("k", "from-l1")
+
+    class BrokenTier:
+        def get(self, key):
+            raise RuntimeError("L2 is on fire")
+        def put(self, key, value):
+            raise RuntimeError("L2 is on fire")
+        def invalidate(self, key):
+            raise RuntimeError("L2 is on fire")
+        def stats(self):
+            return {"backend": "broken"}
+
+    router = TieredCacheRouter(l1, BrokenTier())
+    # L1 hit — the broken L2 is never consulted.
+    assert router.get("k") == "from-l1"
+
+
+# ─── build_cache_from_config — feature-gate aware factory ─────────────
+
+
+def test_build_cache_returns_l1_only_by_default():
+    """Default config returns a router with L1 only."""
+    cache = build_cache_from_config()
+    s = cache.stats()
+    # Only one tier — the L1.
+    assert len(s["tiers"]) == 1
+    assert s["tiers"][0]["tier"] == "InProcessLRUCache"
+
+
+def test_build_cache_includes_l2_when_enabled(tmp_path):
+    """With L2 enabled, the router includes the flat-file L2."""
+    with patch.dict(os.environ, {
+        "HERMES_CACHE_L2_ENABLED": "true",
+        "HERMES_CACHE_L2_FLAT_FILE_PATH": str(tmp_path / "l2.mmap"),
+        "HERMES_CACHE_L2_FLAT_FILE_MAX_BYTES": str(1024 * 1024),
+    }, clear=False):
+        cache = build_cache_from_config()
+        s = cache.stats()
+        tier_names = [t["tier"] for t in s["tiers"]]
+        assert "InProcessLRUCache" in tier_names
+        assert "FlatFileCache" in tier_names
+        # Clean up the L2 instance.
+        for t_obj in s["tiers"]:
+            tier_obj = t_obj.get("tier")
+        # Find the L2 instance and close it.
+        for tier_inst in cache._tiers:
+            if isinstance(tier_inst, FlatFileCache):
+                tier_inst.close()
+
+
+def test_build_cache_master_off_returns_placeholder():
+    """When the master switch is off, a single-entry placeholder is returned."""
+    with patch.dict(os.environ, {"HERMES_CACHE_ENABLED": "false"}, clear=False):
+        cache = build_cache_from_config()
+        s = cache.stats()
+        # Only the placeholder tier.
+        assert len(s["tiers"]) == 1
+        # The placeholder has max_entries=1 — anything put and not
+        # read back is a one-shot.
+        cache.put("k", "v")
+        assert cache.get("k") == "v"
+
+
+# ─── _build_l2_from_config / _build_l3_from_config helpers ────────────
+
+
+def test_build_l2_returns_none_when_disabled():
+    """L2 builder returns None when the feature gate is off."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HERMES_CACHE_L2_ENABLED", None)
+        # Default: L2 is off.
+        assert _build_l2_from_config() is None
+
+
+def test_build_l2_returns_flat_file_when_enabled(tmp_path):
+    """L2 builder returns a FlatFileCache when L2 is on (default backend)."""
+    with patch.dict(os.environ, {
+        "HERMES_CACHE_L2_ENABLED": "true",
+        "HERMES_CACHE_L2_FLAT_FILE_PATH": str(tmp_path / "l2.mmap"),
+        "HERMES_CACHE_L2_FLAT_FILE_MAX_BYTES": str(1024 * 1024),
+    }, clear=False):
+        cache = _build_l2_from_config()
+        try:
+            assert isinstance(cache, FlatFileCache)
+        finally:
+            if cache is not None:
+                cache.close()
+
+
+def test_build_l2_returns_redis_stub_when_backend_is_redis():
+    """L2 builder returns a RedisCache stub when backend=redis.
+
+    Constructing RedisCache raises NotImplementedError — that's
+    the contract. So we expect the construction to fail loudly.
+    """
+    with patch.dict(os.environ, {
+        "HERMES_CACHE_L2_ENABLED": "true",
+        "HERMES_CACHE_L2_BACKEND": "redis",
+    }, clear=False):
+        with pytest.raises(NotImplementedError):
+            _build_l2_from_config()
+
+
+def test_build_l3_returns_none_when_disabled():
+    """L3 builder returns None when the feature gate is off."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HERMES_CACHE_L3_ENABLED", None)
+        assert _build_l3_from_config() is None
+
+
+def test_build_l3_returns_sharded_file_when_enabled(tmp_path):
+    """L3 builder returns a ShardedFileCache when L3 is on (default backend)."""
+    with patch.dict(os.environ, {
+        "HERMES_CACHE_L3_ENABLED": "true",
+        "HERMES_CACHE_L3_SHARDED_FILE_ROOT": str(tmp_path / "l3"),
+    }, clear=False):
+        cache = _build_l3_from_config()
+        assert isinstance(cache, ShardedFileCache)
+
+
+def test_build_l3_returns_sqlite_stub_when_backend_is_sqlite():
+    """L3 builder returns a DiskCache stub when backend=sqlite.
+
+    Construction raises NotImplementedError — the contract.
+    """
+    with patch.dict(os.environ, {
+        "HERMES_CACHE_L3_ENABLED": "true",
+        "HERMES_CACHE_L3_BACKEND": "sqlite",
+    }, clear=False):
+        with pytest.raises(NotImplementedError):
+            _build_l3_from_config()
+

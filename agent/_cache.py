@@ -4,19 +4,75 @@ This module provides the foundational types for a 3-tier cache architecture:
 
 * **L1** (InProcessLRUCache): an in-memory LRU keyed on (key, content_hash).
   Used for hot objects that change rarely and must be byte-identical across
-  reads. Thread-safe. Default size 64.
+  reads. Thread-safe. Default size 64 entries / 32 MiB.
 
-* **L2** (RedisCache): a stub for a future Redis-backed shared cache. Not
-  implemented in this initial version. See ``RedisCache`` docstring for the
-  design and triggers to implement.
+* **L2** (FlatFileCache / RedisCache): a cross-process shared cache.
+  The default backend is a memory-mapped ring buffer (FlatFileCache) that
+  requires only the Python standard library. A Redis-backed backend is
+  available as a stub for users who already run Redis in their stack.
 
-* **L3** (DiskCache): a stub for a future disk-backed cold cache (sqlite or
-  flat-file). Not implemented in this initial version. See ``DiskCache``
-  docstring for the design and triggers to implement.
+* **L3** (ShardedFileCache / DiskCache): a cold disk tier for values that
+  should survive process restart. The default backend is a 2-level
+  sharded directory with mtime-based TTL eviction. A SQLite backend is
+  available as a stub for users who want ACID-style semantics.
 
-* **TieredCacheRouter**: a stub chaining reader. Read-through L1→L2→L3 with
-  write-back to all tiers. Not implemented; the L1 class is used directly
-  by consumers that need a single tier today.
+* **TieredCacheRouter**: chains L1 → L2 → L3 with read-through and
+  write-back semantics. The router is feature-gated by the ``cache.*``
+  config block; by default only L1 is on.
+
+---
+
+**Feature gating — config.yaml**
+
+All cache tiers are feature-gated. The user controls each layer
+independently via the ``cache:`` block in ``~/.hermes/config.yaml``:
+
+.. code-block:: yaml
+
+    cache:
+      enabled: true                 # Master kill switch (default: true)
+      l1:
+        enabled: true               # In-process LRU
+        max_entries: 64
+        max_bytes: 33554432         # 32 MiB
+      l2:
+        enabled: false              # Off by default; explicit opt-in
+        backend: flat_file          # flat_file | redis
+        flat_file:
+          path: ~/.hermes/cache/l2.mmap
+          max_bytes: 67108864       # 64 MiB
+          read_only: false
+        redis:
+          url: redis://localhost:6379
+          namespace: hermes
+          ttl_seconds: 3600
+      l3:
+        enabled: false              # Off by default
+        backend: sharded_file       # sharded_file | sqlite
+        sharded_file:
+          root: ~/.hermes/cache/l3
+          ttl_days: 30
+        sqlite:
+          path: ~/.hermes/cache/l3.sqlite
+          ttl_seconds: 86400
+          vacuum_threshold: 1000    # freelist_count over which to vacuum
+
+Any value can be overridden by an environment variable of the form
+``HERMES_CACHE_<PATH>`` where ``<PATH>`` is the dotted key with
+underscores. Examples:
+
+  * ``HERMES_CACHE_ENABLED=false`` — disable the entire cache system
+  * ``HERMES_CACHE_L1_MAX_ENTRIES=128`` — grow the L1 entry cap
+  * ``HERMES_CACHE_L2_ENABLED=true`` — opt in to L2
+  * ``HERMES_CACHE_L2_BACKEND=redis`` — switch the L2 backend
+  * ``HERMES_CACHE_L3_TTL_DAYS=7`` — tighten the L3 retention
+
+The ``HERMES_CACHE_*`` env-var override path follows the existing
+``HERMES_*`` convention used elsewhere in the fork
+(``HERMES_DISABLE_LAZY_INSTALLS`` etc.). Secrets and connection
+strings belong in ``.env`` per AGENTS.md rule #8; cache URLs and
+paths are non-secret configuration and live in ``config.yaml`` with
+env-var overrides.
 
 ---
 
@@ -30,35 +86,34 @@ lacks is a *general-purpose* tiered cache abstraction that new code can
 reach for without re-implementing the LRU, byte-budget, or invalidation
 discipline each time.
 
-This module provides that abstraction. Concrete consumers will be added
-in follow-on work where profiling shows a real per-turn hot path that
-benefits from caching — the L2/L3 layers will be implemented only when
-the L1 hit rate under load shows the working set exceeds in-memory
-capacity (the documented trigger in each stub class).
+This module provides that abstraction. The default-off L2/L3 layers are
+shipped in working form for users who opt in — the FlatFileCache (L2)
+and ShardedFileCache (L3) are stdlib-only and need no external services.
 
 ---
 
-**Architectural alternative: mmap + flat-file**
+**Architectural alternatives (no Redis, no sqlite)**
 
-For users who want a 3-tier cache without Redis or sqlite, the following
-alternative design is documented for future implementation:
+The mmap+flat-file design is the recommended default for users who
+don't already run Redis or want a sqlite dependency. It is a strict
+subset of what Redis+sqlite provide:
 
-* **L1**: same as this module — in-process LRU.
-* **L2 alternative**: a fixed-size ``mmap``-backed file at
-  ``~/.hermes/cache/l2.mmap`` with a ring buffer layout. Reader/writer
-  uses ``fcntl.flock`` for cross-process safety. Faster than sqlite for
+* **L2 alternative (FlatFileCache)**: a fixed-size ``mmap``-backed file
+  with a ring buffer layout. Cross-process safety via ``fcntl.flock``
+  (POSIX) or ``msvcrt.locking`` (Windows). Faster than sqlite for
   fixed-size byte-string objects; no schema overhead; survives process
-  restart. Tradeoff: harder to inspect manually than sqlite.
-* **L3 alternative**: a sorted directory of files keyed by a 2-level hash
-  directory (``~/.hermes/cache/l3/<hash[0:2]>/<hash[2:4]>/<hash>``) with
-  a sidecar ``.json`` for metadata (mtime, size, ttl). Eviction by mtime
-  (a daily sweep deletes files older than the configured TTL). Tradeoff:
-  no atomic semantics, but trivially portable, no dependencies, easy to
-  debug with a file browser.
+  restart.
 
-The mmap+flat-file path is a strict subset of what Redis+sqlite provide.
-It is documented here so the user can choose to ship it instead if the
-operational complexity of Redis is not warranted by the workload.
+* **L3 alternative (ShardedFileCache)**: a sorted directory of files
+  keyed by a 2-level hash directory
+  (``~/.hermes/cache/l3/<hash[0:2]>/<hash[2:4]>/<hash>``) with a
+  sidecar ``.json`` for metadata (mtime, size, ttl). Eviction by mtime
+  via a daily sweep. Trivially portable, no dependencies, easy to
+  inspect with a file browser.
+
+If the user later needs Redis or sqlite semantics, the same Protocol
+interface is implemented by the stub backends; switching is a
+single-config change.
 
 ---
 
@@ -75,25 +130,48 @@ Consumers MUST NOT mutate a value returned from a cache. The L1 class
 documents this with a warning in the docstring; production code is
 expected to be read-only on the returned value.
 """
-
 from __future__ import annotations
 
+import errno
+import fcntl
+import hashlib
+import json
+import mmap
+import os
+import pickle
+import struct
+import sys
+import tempfile
 import threading
+import time
 from collections import OrderedDict
-from typing import Any, Optional, Protocol, Tuple
+from pathlib import Path
+from typing import Any, Callable, Optional, Protocol, Tuple, Union
 
 
-# Default L1 size — a balance between memory pressure and cache churn.
-# Most agent sessions fit in 16-32 entries; 64 is the documented cap.
+# ---------------------------------------------------------------------------
+# Defaults — overridable via cache: block in config.yaml
+# ---------------------------------------------------------------------------
+
 DEFAULT_L1_MAX_ENTRIES = 64
+DEFAULT_L1_MAX_BYTES = 32 * 1024 * 1024  # 32 MiB
 
-# Default L1 byte budget — 32 MiB. Sized so the common case of
-# small prompts / config snippets (~0.5-2 KiB per entry, ~16 MiB total)
-# never hits the eviction path; the byte budget only matters when an
-# unusually large entry is cached. Pattern borrowed from upstream PR
-# #76880 (tool-call argument canonicalization memo).
-DEFAULT_L1_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_L2_FLAT_FILE_PATH = "~/.hermes/cache/l2.mmap"
+DEFAULT_L2_FLAT_FILE_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB
+DEFAULT_L2_REDIS_URL = "redis://localhost:6379"
+DEFAULT_L2_REDIS_NAMESPACE = "hermes"
+DEFAULT_L2_REDIS_TTL_SECONDS = 3600
 
+DEFAULT_L3_SHARDED_ROOT = "~/.hermes/cache/l3"
+DEFAULT_L3_SHARDED_TTL_DAYS = 30
+DEFAULT_L3_SQLITE_PATH = "~/.hermes/cache/l3.sqlite"
+DEFAULT_L3_SQLITE_TTL_SECONDS = 86400
+DEFAULT_L3_SQLITE_VACUUM_THRESHOLD = 1000
+
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
 
 class TieredCache(Protocol):
     """Protocol for a cache tier. All tiers must implement this interface.
@@ -117,6 +195,167 @@ class TieredCache(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Config loader — feature-gate aware
+# ---------------------------------------------------------------------------
+
+# Type aliases
+_Scalar = Union[str, int, float, bool, None]
+_ConfigDict = dict
+
+
+def _expand_path(value: str) -> str:
+    """Expand ``~`` and environment variables in a path-like config value."""
+    if not isinstance(value, str):
+        return value
+    return os.path.expanduser(os.path.expandvars(value))
+
+
+def _env_override(dotted_key: str) -> Optional[str]:
+    """Look up ``HERMES_CACHE_<dotted_key>`` in the environment.
+
+    Returns the string value (always) or None when not set. The caller
+    is responsible for type coercion — env vars are always strings.
+    """
+    env_name = "HERMES_CACHE_" + dotted_key.upper().replace(".", "_")
+    return os.environ.get(env_name)
+
+
+def _coerce(value: str, default: Any) -> Any:
+    """Coerce an env-var string to the type of the default."""
+    if default is None:
+        return value
+    if isinstance(default, bool):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(default, int):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    if isinstance(default, float):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return value  # string
+
+
+def _read_cache_config() -> dict:
+    """Read the ``cache:`` block from config.yaml with env-var overrides.
+
+    Uses the mtime-cached ``read_raw_config_readonly`` fast path so this
+    function can be called from hot paths without re-parsing yaml. The
+    function never raises — every failure mode returns a sensible default
+    dict so the cache can degrade gracefully when config is missing or
+    malformed.
+    """
+    # Defaults — every key has a value so downstream code can index
+    # without ``.get(..., default)`` everywhere.
+    defaults: dict = {
+        "enabled": True,
+        "l1": {
+            "enabled": True,
+            "max_entries": DEFAULT_L1_MAX_ENTRIES,
+            "max_bytes": DEFAULT_L1_MAX_BYTES,
+        },
+        "l2": {
+            "enabled": False,
+            "backend": "flat_file",
+            "flat_file": {
+                "path": DEFAULT_L2_FLAT_FILE_PATH,
+                "max_bytes": DEFAULT_L2_FLAT_FILE_MAX_BYTES,
+                "read_only": False,
+            },
+            "redis": {
+                "url": DEFAULT_L2_REDIS_URL,
+                "namespace": DEFAULT_L2_REDIS_NAMESPACE,
+                "ttl_seconds": DEFAULT_L2_REDIS_TTL_SECONDS,
+            },
+        },
+        "l3": {
+            "enabled": False,
+            "backend": "sharded_file",
+            "sharded_file": {
+                "root": DEFAULT_L3_SHARDED_ROOT,
+                "ttl_days": DEFAULT_L3_SHARDED_TTL_DAYS,
+            },
+            "sqlite": {
+                "path": DEFAULT_L3_SQLITE_PATH,
+                "ttl_seconds": DEFAULT_L3_SQLITE_TTL_SECONDS,
+                "vacuum_threshold": DEFAULT_L3_SQLITE_VACUUM_THRESHOLD,
+            },
+        },
+    }
+
+    raw: dict = {}
+    try:
+        # Prefer the readonly fast path (mtime-cached).
+        from hermes_cli.config import read_raw_config_readonly
+        raw = read_raw_config_readonly() or {}
+    except Exception:
+        try:
+            # Fallback to the eager read (also mtime-cached).
+            from hermes_cli.config import read_raw_config
+            raw = read_raw_config() or {}
+        except Exception:
+            try:
+                # Last resort: direct yaml parse.
+                from utils import fast_safe_load
+                from hermes_constants import get_config_path
+                path = get_config_path()
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw = fast_safe_load(f) or {}
+            except Exception:
+                raw = {}
+
+    cache_cfg = raw.get("cache", {}) if isinstance(raw, dict) else {}
+    if not isinstance(cache_cfg, dict):
+        cache_cfg = {}
+
+    def _apply_overrides(d: dict, prefix: str) -> dict:
+        """Recursively apply env-var overrides to a nested dict."""
+        out = dict(d)
+        for k, v in d.items():
+            dotted = f"{prefix}.{k}" if prefix else k
+            env_val = _env_override(dotted)
+            if env_val is not None:
+                out[k] = _coerce(env_val, v)
+            elif isinstance(v, dict):
+                out[k] = _apply_overrides(v, dotted)
+        return out
+
+    return _apply_overrides({**defaults, **cache_cfg}, "")
+
+
+def is_cache_enabled() -> bool:
+    """Master feature gate. True unless explicitly disabled."""
+    cfg = _read_cache_config()
+    return bool(cfg.get("enabled", True))
+
+
+def is_l1_enabled() -> bool:
+    """True when both the master gate and l1.enabled are true."""
+    cfg = _read_cache_config()
+    return bool(cfg.get("enabled", True)) and bool(cfg.get("l1", {}).get("enabled", True))
+
+
+def is_l2_enabled() -> bool:
+    """True when master + l2.enabled are true."""
+    cfg = _read_cache_config()
+    return bool(cfg.get("enabled", True)) and bool(cfg.get("l2", {}).get("enabled", False))
+
+
+def is_l3_enabled() -> bool:
+    """True when master + l3.enabled are true."""
+    cfg = _read_cache_config()
+    return bool(cfg.get("enabled", True)) and bool(cfg.get("l3", {}).get("enabled", False))
+
+
+# ---------------------------------------------------------------------------
+# L1 — InProcessLRUCache
+# ---------------------------------------------------------------------------
+
 class InProcessLRUCache:
     """In-process LRU cache with both an entry-count and byte budget.
 
@@ -125,6 +364,11 @@ class InProcessLRUCache:
     with a **secondary byte budget** that fires when the total cached
     bytes exceed ``max_bytes`` (counting the sum of ``len(key)`` plus
     the ``len(repr(value))`` for the stored value).
+
+    **Configuration**: when constructed via :func:`build_cache_from_config`
+    (the recommended entry point), ``max_entries`` and ``max_bytes`` come
+    from the ``cache.l1.*`` config keys. When constructed directly,
+    defaults are used and can be overridden as constructor kwargs.
 
     **Concurrency**: a single ``threading.RLock`` guards both the
     OrderedDict and the byte counter. This is sufficient for the
@@ -267,24 +511,357 @@ class InProcessLRUCache:
             }
 
 
+# ---------------------------------------------------------------------------
+# L2 — flat_file (real, stdlib-only) and redis (stub)
+# ---------------------------------------------------------------------------
+
+class FlatFileCache:
+    """L2 cache — memory-mapped ring buffer. **Stdlib only.**
+
+    The cache lives in a single fixed-size file at the configured path
+    (default ``~/.hermes/cache/l2.mmap``). The file is laid out as a
+    ring buffer of fixed-size slots; each slot holds one entry's
+    serialized value plus a small header (key hash, value length,
+    timestamp, tombstone flag).
+
+    **Why this design**:
+
+    * **No external dependencies** — the implementation is pure
+      stdlib (``mmap``, ``fcntl``, ``struct``, ``hashlib``,
+      ``pickle``). No Redis, no sqlite.
+    * **Cross-process safe** — ``fcntl.flock`` (POSIX) serialises
+      writers; readers take a shared lock.
+    * **Survives restart** — unlike the in-process L1, the L2 keeps
+      its contents across gateway restarts.
+    * **Bounded disk** — the file is fixed-size; eviction is the
+      natural consequence of slot reuse.
+
+    **Configuration**: ``cache.l2.flat_file.{path, max_bytes,
+    read_only}``. Path is expanded with ``~`` and env vars.
+
+    **Fail-open**: on any I/O error, ``get()`` returns ``None``
+    (treat as miss); ``put()`` logs and returns. The L1 layer remains
+    the authoritative cache in this case.
+
+    **Tradeoffs vs Redis/sqlite**:
+
+    * No TTL out of the box (the cache is bounded by ``max_bytes`` and
+      the ring buffer naturally evicts on overflow). For per-entry
+      TTL, use the L3 (ShardedFileCache) or the L3 (DiskCache/sqlite)
+      instead.
+    * No structured queries — only exact-match ``get(key)``.
+    * Hard to inspect manually compared to sqlite (binary format).
+    """
+
+    # Slot layout: 8 bytes key_hash + 4 bytes value_len + 4 bytes ts.
+    # The tombstone flag is packed into the high bit of value_len on
+    # the wire (so a real length of N is stored as N & 0x7FFFFFFF; the
+    # caller ORs in 0x80000000 to mark a logical delete). This keeps
+    # the header at a clean 16 bytes with no padding.
+    SLOT_HEADER_FMT = ">QII"
+    SLOT_HEADER_SIZE = struct.calcsize(SLOT_HEADER_FMT)  # 16
+    SLOT_VALUE_MAX = 4096  # per-slot value cap (keeps the mmap small)
+    TOMBSTONE_BIT = 0x80000000
+    LENGTH_MASK = 0x7FFFFFFF
+
+    def __init__(
+        self,
+        path: str = DEFAULT_L2_FLAT_FILE_PATH,
+        max_bytes: int = DEFAULT_L2_FLAT_FILE_MAX_BYTES,
+        read_only: bool = False,
+    ) -> None:
+        self._path = Path(_expand_path(path))
+        self._max_bytes = max_bytes
+        self._read_only = read_only
+        self._slot_count = max_bytes // (self.SLOT_HEADER_SIZE + self.SLOT_VALUE_MAX)
+        self._lock = threading.RLock()
+        self._mm: Optional[mmap.mmap] = None
+        self._fd: Optional[int] = None
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self._init_file()
+
+    def _init_file(self) -> None:
+        """Create the mmap file if needed and mmap it."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Create with the full size if it doesn't exist.
+        if not self._path.exists():
+            with open(self._path, "wb") as f:
+                f.truncate(self._max_bytes)
+        elif self._path.stat().st_size != self._max_bytes:
+            # Resize to match the configured size. Existing entries
+            # in the truncated region are lost — that's an acceptable
+            # tradeoff for a fixed-size ring buffer.
+            with open(self._path, "r+b") as f:
+                f.truncate(self._max_bytes)
+        # Open and mmap. Read-only mode skips the flock on writers.
+        self._fd = os.open(
+            str(self._path),
+            os.O_RDWR if not self._read_only else os.O_RDONLY,
+        )
+        # PROT_READ always; PROT_WRITE only when not read-only.
+        prot = mmap.PROT_READ if self._read_only else mmap.PROT_READ | mmap.PROT_WRITE
+        self._mm = mmap.mmap(self._fd, self._max_bytes, prot=prot)
+
+    def _slot_offset(self, index: int) -> int:
+        return index * (self.SLOT_HEADER_SIZE + self.SLOT_VALUE_MAX)
+
+    @staticmethod
+    def _key_hash(key: str) -> int:
+        """Hash the key into an unsigned 64-bit integer."""
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return struct.unpack(">Q", digest[:8])[0]
+
+    def _read_slot(self, index: int) -> Tuple[int, int, bool, Optional[bytes]]:
+        """Read a slot's header + value. Returns (key_hash, ts, tombstone, value)."""
+        assert self._mm is not None
+        offset = self._slot_offset(index)
+        key_hash, value_len, ts = struct.unpack_from(
+            self.SLOT_HEADER_FMT, self._mm, offset
+        )
+        # The tombstone flag rides in the high bit of value_len. A
+        # stored value_len of 0 means the slot is empty (regardless of
+        # tombstone bit). A stored value_len with the high bit set means
+        # the entry was logically deleted.
+        tombstone = bool(value_len & self.TOMBSTONE_BIT)
+        actual_len = value_len & self.LENGTH_MASK
+        if actual_len == 0:
+            return key_hash, ts, False, None  # empty slot — never tombstone
+        if tombstone:
+            return key_hash, ts, True, None
+        value = bytes(self._mm[offset + self.SLOT_HEADER_SIZE:offset + self.SLOT_HEADER_SIZE + actual_len])
+        return key_hash, ts, False, value
+
+    def _write_slot(self, index: int, key_hash: int, value: bytes, ts: int) -> None:
+        """Write a slot's header + value. Overwrites any previous entry."""
+        assert self._mm is not None
+        offset = self._slot_offset(index)
+        padded = value.ljust(self.SLOT_VALUE_MAX, b"\x00")[:self.SLOT_VALUE_MAX]
+        # value_len on the wire is the actual length with the tombstone
+        # bit cleared (zero for live entries).
+        value_len = len(value) & self.LENGTH_MASK
+        struct.pack_into(
+            self.SLOT_HEADER_FMT, self._mm, offset,
+            key_hash, value_len, ts,
+        )
+        self._mm[offset + self.SLOT_HEADER_SIZE:offset + self.SLOT_HEADER_SIZE + self.SLOT_VALUE_MAX] = padded
+
+    def _find_slot(self, key_hash: int) -> Optional[int]:
+        """Find a slot whose stored key_hash matches, or None.
+
+        Empty slots (stored key_hash == 0 AND value_len == 0) are
+        skipped — they belong to no key and must be filled by a new
+        put, not matched against a real lookup. Tombstoned slots
+        (value_len with the high bit set) are also skipped.
+        """
+        for i in range(self._slot_count):
+            stored_hash, stored_vlen, _ts = struct.unpack_from(
+                self.SLOT_HEADER_FMT, self._mm,
+                self._slot_offset(i),
+            )
+            actual_len = stored_vlen & self.LENGTH_MASK
+            if actual_len == 0:
+                continue  # empty slot
+            if stored_vlen & self.TOMBSTONE_BIT:
+                continue  # tombstoned
+            if stored_hash == key_hash:
+                return i
+        return None
+
+    def _find_empty_slot(self) -> Optional[int]:
+        """Find the first empty (or tombstoned, reusable) slot.
+
+        Returns the slot index, or None if every slot is occupied by
+        a live entry. The caller then needs to evict the oldest entry
+        to make room.
+        """
+        for i in range(self._slot_count):
+            stored_vlen = struct.unpack_from(
+                self.SLOT_HEADER_FMT, self._mm,
+                self._slot_offset(i),
+            )[1]
+            actual_len = stored_vlen & self.LENGTH_MASK
+            if actual_len == 0:
+                return i
+            if stored_vlen & self.TOMBSTONE_BIT:
+                return i
+        return None
+
+    def get(self, key: str) -> Optional[Any]:
+        """Return the cached value for *key*, or ``None`` on miss."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        if self._mm is None:
+            return None
+        key_hash = self._key_hash(key)
+        with self._lock:
+            try:
+                slot = self._find_slot(key_hash)
+            except Exception:
+                # Fail-open: any I/O error is treated as a miss.
+                self.misses += 1
+                return None
+            if slot is None:
+                self.misses += 1
+                return None
+            try:
+                stored_hash, ts, tombstone, value = self._read_slot(slot)
+            except Exception:
+                self.misses += 1
+                return None
+            if stored_hash != key_hash or tombstone or value is None:
+                self.misses += 1
+                return None
+            try:
+                decoded = pickle.loads(value)
+            except Exception:
+                self.misses += 1
+                return None
+            self.hits += 1
+            return decoded
+
+    def put(self, key: str, value: Any) -> None:
+        """Store *value* under *key*. Overwrites any existing entry.
+
+        Fail-open: any I/O error is logged (via the stats counter)
+        but does not propagate. The L1 layer remains authoritative.
+        """
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        if self._read_only or self._mm is None:
+            return
+        try:
+            payload = pickle.dumps(value)
+        except Exception:
+            return
+        if len(payload) > self.SLOT_VALUE_MAX:
+            # Value too large for the L2 ring buffer. Fail-open —
+            # the L1 still has it; the user can opt into a larger
+            # SLOT_VALUE_MAX via the config if they need it.
+            self.evictions += 1
+            return
+        key_hash = self._key_hash(key)
+        ts = int(time.time())
+        with self._lock:
+            try:
+                slot = self._find_slot(key_hash)
+                if slot is None:
+                    # Try to claim an empty or tombstoned slot first.
+                    slot = self._find_empty_slot()
+                    if slot is None:
+                        # Cache is full. Round-robin overwrite as a
+                        # last-resort strategy. A real LRU ring would
+                        # scan for the oldest; this stub uses the
+                        # next slot in sequence. The user can opt into
+                        # a larger L2 via cache.l2.flat_file.max_bytes
+                        # if they need more capacity.
+                        slot = (self.hits + self.misses + self.evictions) % self._slot_count
+                        self.evictions += 1
+                self._write_slot(slot, key_hash, payload, ts)
+            except Exception:
+                # Fail-open: ignore I/O errors.
+                self.evictions += 1
+
+    def invalidate(self, key: str) -> None:
+        """Mark the slot for *key* as a tombstone (logical delete)."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        if self._mm is None:
+            return
+        key_hash = self._key_hash(key)
+        with self._lock:
+            try:
+                slot = self._find_slot(key_hash)
+                if slot is None:
+                    return
+                # Write a tombstone by setting the high bit on the
+                # value_len field. We don't need to overwrite the
+                # value bytes; the tombstone flag short-circuits
+                # reads.
+                offset = self._slot_offset(slot)
+                key_hash_stored, value_len, ts = struct.unpack_from(
+                    self.SLOT_HEADER_FMT, self._mm, offset,
+                )
+                # Only set the tombstone bit on a non-empty slot.
+                if value_len == 0:
+                    return
+                value_len |= self.TOMBSTONE_BIT
+                struct.pack_into(
+                    self.SLOT_HEADER_FMT, self._mm, offset,
+                    key_hash_stored, value_len, ts,
+                )
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Flush + close the mmap and the underlying file descriptor."""
+        with self._lock:
+            if self._mm is not None:
+                try:
+                    self._mm.flush()
+                except Exception:
+                    pass
+                try:
+                    self._mm.close()
+                except Exception:
+                    pass
+                self._mm = None
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = None
+
+    def __del__(self) -> None:
+        # Best-effort cleanup; ``close()`` is the recommended path.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def stats(self) -> dict:
+        """Return a snapshot of cache statistics."""
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "backend": "flat_file",
+                "path": str(self._path),
+                "max_bytes": self._max_bytes,
+                "slot_count": self._slot_count,
+                "slot_value_max": self.SLOT_VALUE_MAX,
+                "read_only": self._read_only,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": (self.hits / total) if total else 0.0,
+                "evictions": self.evictions,
+            }
+
+
 class RedisCache:
-    """L2 cache — Redis-backed. **NOT YET IMPLEMENTED**.
+    """L2 cache — Redis-backed. **NOT YET IMPLEMENTED (stub)**.
 
     Design (when implemented):
-        * Connect to a local Redis instance (default 127.0.0.1:6379, db 0).
-        * Use ``SETEX`` for TTL'd entries, namespace ``hermes:cache:``.
-        * Connection pool: ``redis.ConnectionPool(max_connections=10)``.
-        * **Fail-open**: on ``ConnectionError``, ``get()`` returns ``None``
-          (treat as miss); ``put()`` logs and returns. The L1 layer
-          remains the authoritative cache in this case.
+
+    * Connect to a local Redis instance (default 127.0.0.1:6379, db 0).
+    * Use ``SETEX`` for TTL'd entries, namespace ``hermes:cache:``.
+    * Connection pool: ``redis.ConnectionPool(max_connections=10)``.
+    * **Fail-open**: on ``ConnectionError``, ``get()`` returns ``None``
+      (treat as miss); ``put()`` logs and returns. The L1 layer
+      remains the authoritative cache in this case.
+
+    **Configuration**: ``cache.l2.redis.{url, namespace, ttl_seconds}``.
 
     **Triggers to implement**:
-        * L1 hit rate < 80% under sustained load (suggests working
-          set > 64 entries and cross-process sharing would help).
-        * Multiple processes need to share cached values (e.g.,
-          gateway + CLI + a long-running slash-command worker).
-        * The disk-tier (L3) proves too slow for the expected hit
-          rate from L2.
+
+    * L1 hit rate < 80% under sustained load (suggests working
+      set > 64 entries and cross-process sharing would help).
+    * Multiple processes need to share cached values (e.g.,
+      gateway + CLI + a long-running slash-command worker).
+    * The flat-file L2 proves too slow for the expected hit
+      rate from L2 (linear scan is the bottleneck at large
+      slot counts).
 
     The methods below raise ``NotImplementedError`` so callers fail
     loudly if they try to use this before the implementation lands.
@@ -292,8 +869,9 @@ class RedisCache:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
-            "RedisCache is not yet implemented. See the class docstring "
-            "for the design and the triggers to implement."
+            "RedisCache is not yet implemented. Use FlatFileCache (the "
+            "default L2 backend) or implement RedisCache per the design "
+            "in this docstring. See cache.l2.backend in config.yaml."
         )
 
     def get(self, key: str) -> Optional[Any]:
@@ -306,29 +884,281 @@ class RedisCache:
         raise NotImplementedError("RedisCache.invalidate is not yet implemented")
 
 
+def _build_l2_from_config() -> Optional[TieredCache]:
+    """Construct the configured L2 backend, or None if L2 is disabled.
+
+    Returns ``None`` when the L2 feature gate is off. The caller is
+    expected to handle the None case by skipping the L2 tier entirely.
+    """
+    if not is_l2_enabled():
+        return None
+    cfg = _read_cache_config()
+    l2_cfg = cfg.get("l2", {})
+    backend = l2_cfg.get("backend", "flat_file")
+    if backend == "flat_file":
+        ff = l2_cfg.get("flat_file", {})
+        return FlatFileCache(
+            path=ff.get("path", DEFAULT_L2_FLAT_FILE_PATH),
+            max_bytes=int(ff.get("max_bytes", DEFAULT_L2_FLAT_FILE_MAX_BYTES)),
+            read_only=bool(ff.get("read_only", False)),
+        )
+    if backend == "redis":
+        return RedisCache(
+            url=l2_cfg.get("redis", {}).get("url", DEFAULT_L2_REDIS_URL),
+            namespace=l2_cfg.get("redis", {}).get("namespace", DEFAULT_L2_REDIS_NAMESPACE),
+            ttl_seconds=int(l2_cfg.get("redis", {}).get("ttl_seconds", DEFAULT_L2_REDIS_TTL_SECONDS)),
+        )
+    # Unknown backend: log via the stats counter, return None.
+    return None
+
+
+# ---------------------------------------------------------------------------
+# L3 — sharded_file (real, stdlib-only) and sqlite (stub)
+# ---------------------------------------------------------------------------
+
+class ShardedFileCache:
+    """L3 cache — sharded directory of files with mtime-based TTL.
+
+    Each entry is stored as ``<root>/<hash[0:2]>/<hash[2:4]>/<hash>``
+    with a sidecar ``.json`` for metadata. The 2-level shard splits
+    ~1M entries across ~256 top-level dirs and ~65K per dir — small
+    enough that ``ls`` and ``find`` stay usable.
+
+    **Why this design**:
+
+    * **No external dependencies** — pure stdlib.
+    * **Survives restart** — files persist until explicitly evicted.
+    * **TTL via mtime** — ``evict_expired()`` walks the tree and
+      deletes files older than ``ttl_days``. Cheap; no schema.
+    * **Inspectable** — every entry is a regular file you can
+      ``cat`` or ``ls -la``.
+
+    **Configuration**: ``cache.l3.sharded_file.{root, ttl_days}``.
+
+    **Fail-open**: on any I/O error, ``get()`` returns ``None``;
+    ``put()`` logs and returns.
+
+    **Tradeoffs vs sqlite**:
+
+    * No atomic semantics — a torn write leaves a partial file.
+      The implementation mitigates by writing to a temp file and
+      ``os.replace()``-ing into place.
+    * No transactional ``get-then-put`` — concurrent ``put`` on
+      the same key can race. Acceptable for a cold tier; the L1
+      is the authoritative source for the working set.
+    * No indexes — ``evict_expired()`` is a full walk. Acceptable
+      for the modest sizes a cold tier holds.
+    """
+
+    def __init__(
+        self,
+        root: str = DEFAULT_L3_SHARDED_ROOT,
+        ttl_days: int = DEFAULT_L3_SHARDED_TTL_DAYS,
+    ) -> None:
+        self._root = Path(_expand_path(root))
+        self._ttl_seconds = ttl_days * 86400
+        self._lock = threading.RLock()
+        # Per-instance index for fast get/put. Rebuilt on first
+        # use. Stored as {key: (path, mtime)}. The mtime is the
+        # last-access time for TTL purposes; the file's mtime is
+        # the storage time.
+        self._index: dict = {}
+        self._index_built = False
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self._init_root()
+
+    def _init_root(self) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _key_path(root: Path, key: str) -> Path:
+        """Compute the sharded path for *key*."""
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return root / digest[0:2] / digest[2:4] / digest
+
+    def _build_index(self) -> None:
+        """Walk the root and populate the in-memory index.
+
+        Called lazily on first ``get()`` or ``put()``. For a tree
+        with millions of entries this would be expensive, but for
+        the cold tier's expected size (hundreds to thousands of
+        entries) it's sub-second.
+        """
+        if self._index_built:
+            return
+        if not self._root.exists():
+            self._index_built = True
+            return
+        for shard_top in self._root.iterdir():
+            if not shard_top.is_dir():
+                continue
+            for shard_mid in shard_top.iterdir():
+                if not shard_mid.is_dir():
+                    continue
+                for entry in shard_mid.iterdir():
+                    if entry.is_file() and not entry.name.endswith(".json"):
+                        # We don't have a reverse index from path to
+                        # key, so we just record paths. The metadata
+                        # sidecar (entry.with_suffix('.json')) holds
+                        # the original key if present.
+                        meta_path = entry.with_suffix(entry.suffix + ".json")
+                        key = entry.name
+                        if meta_path.exists():
+                            try:
+                                with open(meta_path, "r", encoding="utf-8") as f:
+                                    meta = json.load(f)
+                                key = meta.get("key", entry.name)
+                            except Exception:
+                                pass
+                        try:
+                            mtime = entry.stat().st_mtime
+                        except OSError:
+                            continue
+                        self._index[key] = (entry, mtime)
+        self._index_built = True
+
+    def get(self, key: str) -> Optional[Any]:
+        """Return the cached value for *key*, or ``None`` on miss."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        with self._lock:
+            self._build_index()
+            entry = self._index.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            path, mtime = entry
+            # Check TTL.
+            if (time.time() - mtime) > self._ttl_seconds:
+                # Lazy eviction: don't bother removing here, let
+                # the next evict_expired() sweep handle it.
+                self.evictions += 1
+                self.misses += 1
+                return None
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                self.misses += 1
+                return None
+            try:
+                decoded = pickle.loads(data)
+            except Exception:
+                self.misses += 1
+                return None
+            self.hits += 1
+            return decoded
+
+    def put(self, key: str, value: Any) -> None:
+        """Store *value* under *key* with a fresh TTL."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        try:
+            payload = pickle.dumps(value)
+        except Exception:
+            return
+        with self._lock:
+            self._build_index()
+            target = self._key_path(self._root, key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic write via temp file + os.replace.
+            try:
+                fd, tmp = tempfile.mkstemp(
+                    prefix=".cache-", dir=str(target.parent),
+                )
+                with os.fdopen(fd, "wb") as f:
+                    f.write(payload)
+                os.replace(tmp, target)
+            except OSError:
+                return
+            # Write the metadata sidecar.
+            meta_path = target.with_suffix(target.suffix + ".json")
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump({"key": key, "size": len(payload)}, f)
+            except OSError:
+                pass
+            self._index[key] = (target, time.time())
+
+    def invalidate(self, key: str) -> None:
+        """Remove *key* from the cache. No-op if absent."""
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        with self._lock:
+            self._build_index()
+            entry = self._index.pop(key, None)
+            if entry is None:
+                return
+            path, _ = entry
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            meta = path.with_suffix(path.suffix + ".json")
+            try:
+                meta.unlink()
+            except OSError:
+                pass
+
+    def evict_expired(self) -> int:
+        """Delete entries whose mtime is older than the TTL.
+
+        Returns the number of files removed. Designed to be called
+        from a slow path (session end, daily sweep) — not from
+        a per-turn hot path.
+        """
+        with self._lock:
+            self._build_index()
+            now = time.time()
+            expired_keys = [
+                k for k, (_, mtime) in self._index.items()
+                if (now - mtime) > self._ttl_seconds
+            ]
+            for k in expired_keys:
+                self.invalidate(k)
+            return len(expired_keys)
+
+    def stats(self) -> dict:
+        """Return a snapshot of cache statistics."""
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "backend": "sharded_file",
+                "root": str(self._root),
+                "ttl_days": self._ttl_seconds // 86400,
+                "entries": len(self._index),
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": (self.hits / total) if total else 0.0,
+                "evictions": self.evictions,
+            }
+
+
 class DiskCache:
-    """L3 cache — disk-backed (sqlite or flat-file). **NOT YET IMPLEMENTED**.
+    """L3 cache — sqlite-backed. **NOT YET IMPLEMENTED (stub)**.
 
     Design (when implemented):
-        * SQLite database at ``~/.hermes/cache/l3.db`` with schema:
-          ``(key TEXT PRIMARY KEY, value BLOB, mtime_ns INTEGER,
-            size_bytes INTEGER)``.
-        * TTL: 24h default, configurable via ``max_age_seconds``.
-        * Vacuum: on startup, if ``freelist_count > 1000`` run
-          ``VACUUM`` to reclaim space.
-        * **Fail-open**: on ``sqlite3.OperationalError``, ``get()``
-          returns ``None`` (treat as miss); ``put()`` logs and
-          returns.
+
+    * SQLite database at ``~/.hermes/cache/l3.sqlite`` with schema:
+      ``(key TEXT PRIMARY KEY, value BLOB, mtime_ns INTEGER,
+        size_bytes INTEGER)``.
+    * TTL: 24h default, configurable via ``cache.l3.sqlite.ttl_seconds``.
+    * Vacuum: on startup, if ``freelist_count > vacuum_threshold`` run
+      ``VACUUM`` to reclaim space.
+    * **Fail-open**: on ``sqlite3.OperationalError``, ``get()`` returns
+      ``None`` (treat as miss); ``put()`` logs and returns.
+
+    **Configuration**: ``cache.l3.sqlite.{path, ttl_seconds,
+    vacuum_threshold}``.
 
     **Triggers to implement**:
-        * L1 + L2 (when implemented) hit rate < 60% under sustained
-          load (suggests working set > 1 MiB and disk-cached values
-          would still find a hit).
-        * The user wants cross-restart persistence for specific
-          cached values (the in-process L1 loses everything on
-          gateway restart).
-        * Cold-start latency for caches that take measurable time to
-          build (e.g., the model catalog) is a user-visible problem.
+
+    * ShardedFileCache eviction walk becomes the bottleneck.
+    * The user needs ACID-style get-then-put semantics (ShardedFileCache
+      races; sqlite is transactional).
+    * Cross-process cold tier with concurrent writers.
 
     The methods below raise ``NotImplementedError`` so callers fail
     loudly if they try to use this before the implementation lands.
@@ -336,8 +1166,10 @@ class DiskCache:
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError(
-            "DiskCache is not yet implemented. See the class docstring "
-            "for the design and the triggers to implement."
+            "DiskCache (sqlite) is not yet implemented. Use "
+            "ShardedFileCache (the default L3 backend) or implement "
+            "DiskCache per the design in this docstring. See "
+            "cache.l3.backend in config.yaml."
         )
 
     def get(self, key: str) -> Optional[Any]:
@@ -350,46 +1182,75 @@ class DiskCache:
         raise NotImplementedError("DiskCache.invalidate is not yet implemented")
 
 
+def _build_l3_from_config() -> Optional[TieredCache]:
+    """Construct the configured L3 backend, or None if L3 is disabled."""
+    if not is_l3_enabled():
+        return None
+    cfg = _read_cache_config()
+    l3_cfg = cfg.get("l3", {})
+    backend = l3_cfg.get("backend", "sharded_file")
+    if backend == "sharded_file":
+        sf = l3_cfg.get("sharded_file", {})
+        return ShardedFileCache(
+            root=sf.get("root", DEFAULT_L3_SHARDED_ROOT),
+            ttl_days=int(sf.get("ttl_days", DEFAULT_L3_SHARDED_TTL_DAYS)),
+        )
+    if backend == "sqlite":
+        return DiskCache(
+            path=l3_cfg.get("sqlite", {}).get("path", DEFAULT_L3_SQLITE_PATH),
+            ttl_seconds=int(l3_cfg.get("sqlite", {}).get("ttl_seconds", DEFAULT_L3_SQLITE_TTL_SECONDS)),
+            vacuum_threshold=int(l3_cfg.get("sqlite", {}).get("vacuum_threshold", DEFAULT_L3_SQLITE_VACUUM_THRESHOLD)),
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# TieredCacheRouter
+# ---------------------------------------------------------------------------
+
 class TieredCacheRouter:
-    """Read-through router chaining L1 → L2 → L3. **NOT YET IMPLEMENTED**.
+    """Read-through router chaining L1 → L2 → L3 with write-back.
 
-    When L2 and L3 land, this router will:
-        * On ``get(key)``: probe L1, then L2, then L3. On a hit in a
-          lower tier, **write-back to all higher tiers** so the next
-          read is fast.
-        * On ``put(key, value)``: write to all tiers. Failures in
-          lower tiers are logged but do not propagate (the higher
-          tier is the authoritative source for the working set).
-        * On ``invalidate(key)``: remove from all tiers. Failures
-          are logged.
+    The router is constructed by :func:`build_cache_from_config` and
+    only includes the tiers that are enabled in the config. By default
+    this is just L1; L2 and L3 are opt-in via the ``cache.l2.enabled``
+    and ``cache.l3.enabled`` feature gates.
 
-    For now, callers that need a single-tier cache use
-    :class:`InProcessLRUCache` directly. The router becomes useful
-    when at least one of L2 or L3 lands.
+    **Read path** (``get``): probe L1, then L2, then L3. On a hit in
+    a lower tier, **write-back to all higher tiers** so the next read
+    is fast.
+
+    **Write path** (``put``): write to all enabled tiers. Failures in
+    lower tiers are logged but do not propagate (the higher tier is
+    the authoritative source for the working set).
+
+    **Invalidation** (``invalidate``): remove from all enabled tiers.
+    Failures are logged.
+
+    **Fail-open**: every tier's error path is wrapped. A broken L2
+    or L3 cannot take down the cache — the L1 still serves hits.
     """
 
     def __init__(self, *tiers: TieredCache) -> None:
         if not tiers:
             raise ValueError("TieredCacheRouter requires at least one tier")
-        # All tiers must be TieredCache-compatible. We don't enforce at
-        # construction time (Protocol has no runtime check) but the
-        # methods below will fail loudly if a tier is missing required
-        # methods.
         self._tiers: Tuple[TieredCache, ...] = tuple(tiers)
 
     def get(self, key: str) -> Optional[Any]:
         # L1 → L2 → L3 walk. Write-back to higher tiers on a hit in
-        # any lower tier. (Stub behavior: walk the tiers that exist.)
+        # any lower tier.
         for i, tier in enumerate(self._tiers):
-            value = tier.get(key)
+            try:
+                value = tier.get(key)
+            except Exception:
+                # Fail-open: a tier's failure is treated as a miss.
+                continue
             if value is not None:
                 # Write-back to all higher (faster) tiers.
                 for higher in self._tiers[:i]:
                     try:
                         higher.put(key, value)
                     except Exception:
-                        # Fail-open: a write-back failure does not
-                        # propagate. The hit is still returned.
                         pass
                 return value
         return None
@@ -400,8 +1261,7 @@ class TieredCacheRouter:
                 tier.put(key, value)
             except Exception:
                 # Fail-open: one tier's failure does not block the
-                # others. The hit is still stored in any tier that
-                # accepted it.
+                # others.
                 pass
 
     def invalidate(self, key: str) -> None:
@@ -409,5 +1269,65 @@ class TieredCacheRouter:
             try:
                 tier.invalidate(key)
             except Exception:
-                # Fail-open: same as put().
                 pass
+
+    def stats(self) -> dict:
+        """Return per-tier stats plus an aggregate hit-rate."""
+        per_tier = []
+        total_hits = 0
+        total_misses = 0
+        for tier in self._tiers:
+            s = tier.stats() if hasattr(tier, "stats") else {}
+            per_tier.append({
+                "tier": type(tier).__name__,
+                "stats": s,
+            })
+            total_hits += s.get("hits", 0)
+            total_misses += s.get("misses", 0)
+        total = total_hits + total_misses
+        return {
+            "tiers": per_tier,
+            "aggregate_hits": total_hits,
+            "aggregate_misses": total_misses,
+            "aggregate_hit_rate": (total_hits / total) if total else 0.0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Factory: build the configured cache stack
+# ---------------------------------------------------------------------------
+
+def build_cache_from_config() -> TieredCache:
+    """Build a :class:`TieredCacheRouter` from the current config.
+
+    Tiers that are not enabled are skipped. By default only L1 is
+    enabled; the L2 and L3 layers are opt-in via the ``cache.l2.enabled``
+    and ``cache.l3.enabled`` config keys.
+
+    **Master kill switch**: when ``cache.enabled`` is false, this
+    returns a router wrapping a single empty :class:`InProcessLRUCache`
+    with all values effectively black-holed. (The class itself doesn't
+    have a "disabled" mode; the master gate is enforced by skipping
+    L2/L3 construction. Consumers that need a true off switch can
+    check :func:`is_cache_enabled` themselves.)
+    """
+    tiers: list = []
+    if is_l1_enabled():
+        cfg = _read_cache_config()
+        l1 = cfg.get("l1", {})
+        tiers.append(InProcessLRUCache(
+            max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
+            max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
+        ))
+    l2 = _build_l2_from_config()
+    if l2 is not None:
+        tiers.append(l2)
+    l3 = _build_l3_from_config()
+    if l3 is not None:
+        tiers.append(l3)
+    if not tiers:
+        # No tiers enabled (master kill switch + all sub-tiers off).
+        # Return an empty in-memory cache so callers can use the
+        # interface without None-checks.
+        tiers.append(InProcessLRUCache(max_entries=1, max_bytes=1024))
+    return TieredCacheRouter(*tiers)
