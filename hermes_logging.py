@@ -35,9 +35,10 @@ import os
 import queue
 import sys
 import threading
+import time
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 # On Windows, stdlib ``RotatingFileHandler`` calls ``os.rename()`` in
 # ``doRollover()`` and fails with ``PermissionError [WinError 32]`` whenever
@@ -798,3 +799,139 @@ def _read_logging_config():
     except Exception:
         pass
     return (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Log retention — age-based pruning beyond RotatingFileHandler's backupCount
+# ---------------------------------------------------------------------------
+#
+# RotatingFileHandler keeps N rotated files in a single cycle (one file
+# per rollover). What it CANNOT do is drop a rotation cycle after the
+# underlying application has been running for weeks — the backup files
+# never go away on their own. That's what log_retention_days is for.
+#
+# The pruning is a separate pass (not a handler hook) because we want it
+# to run from a slow path (session end, disk-cleanup plugin, explicit
+# `hermes logs prune` invocation) rather than on every log write.
+
+_LOG_RETENTION_DEFAULT_DAYS = 30
+_LOG_RETENTION_MIN_DAYS = 1
+_LOG_RETENTION_MAX_DAYS = 365
+
+
+def get_log_retention_days() -> int:
+    """Return the configured log retention in days, clamped to a safe range.
+
+    Reads ``logging.log_retention_days`` from config.yaml. Returns the
+    default (30) when the key is missing or the value is malformed.
+    The clamping protects against a user setting ``0`` (which would
+    prune every log on every run) or ``99999`` (no real ceiling).
+    """
+    try:
+        try:
+            from hermes_cli.config import read_raw_config as _rrc
+            cfg = _rrc() or {}
+        except Exception:
+            from utils import fast_safe_load
+            config_path = get_config_path()
+            if not config_path.exists():
+                return _LOG_RETENTION_DEFAULT_DAYS
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = fast_safe_load(f) or {}
+        log_cfg = cfg.get("logging", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(log_cfg, dict):
+            return _LOG_RETENTION_DEFAULT_DAYS
+        days = log_cfg.get("log_retention_days", _LOG_RETENTION_DEFAULT_DAYS)
+        if not isinstance(days, int) or isinstance(days, bool):
+            return _LOG_RETENTION_DEFAULT_DAYS
+        return max(_LOG_RETENTION_MIN_DAYS, min(_LOG_RETENTION_MAX_DAYS, days))
+    except Exception:
+        return _LOG_RETENTION_DEFAULT_DAYS
+
+
+def prune_old_logs(
+    logs_dir: Optional[Path] = None,
+    *,
+    retention_days: Optional[int] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Delete log files older than ``retention_days`` from the logs dir.
+
+    Operates on the ``*.log*`` files in the Hermes logs directory
+    (``~/.hermes/logs/`` by default). Rotated files (``agent.log.1``,
+    ``agent.log.2``, ...) are the primary target — they accumulate
+    silently under RotatingFileHandler's per-cycle backup_count.
+
+    Parameters
+    ----------
+    logs_dir
+        Directory to scan. Defaults to ``~/.hermes/logs``.
+    retention_days
+        Override the configured retention. When None, reads
+        ``logging.log_retention_days`` from config.yaml.
+    now
+        Override the current time (seconds since epoch). Test-only
+        convenience for deterministic time-based assertions.
+
+    Returns
+    -------
+    A dict with:
+
+      * ``deleted`` — list of deleted file paths (as strings)
+      * ``kept`` — list of file paths that were within retention
+      * ``errors`` — list of (path, error_string) tuples
+      * ``retention_days`` — the effective retention (clamped)
+      * ``scanned`` — total files inspected
+
+    The function never raises — every file deletion is wrapped in a
+    try/except so one EACCES / EBUSY / file-in-use file can't abort
+    the whole sweep.
+    """
+    if logs_dir is None:
+        logs_dir = get_hermes_home() / "logs"
+    if not isinstance(logs_dir, Path):
+        logs_dir = Path(logs_dir)
+    if retention_days is None:
+        retention_days = get_log_retention_days()
+    # Clamp the same way the getter does, in case the caller passed a
+    # user-supplied value via the CLI.
+    retention_days = max(
+        _LOG_RETENTION_MIN_DAYS,
+        min(_LOG_RETENTION_MAX_DAYS, int(retention_days)),
+    )
+    if now is None:
+        now = time.time()
+
+    cutoff = now - (retention_days * 86400)
+
+    result: Dict[str, Any] = {
+        "deleted": [],
+        "kept": [],
+        "errors": [],
+        "retention_days": retention_days,
+        "scanned": 0,
+    }
+
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return result
+
+    # Match the canonical log naming: agent.log, agent.log.1, agent.log.2,
+    # plus a few well-known companions. The pattern is intentionally
+    # narrow — we don't want to delete user files in the logs dir.
+    for log_file in sorted(logs_dir.glob("*.log*")):
+        result["scanned"] += 1
+        try:
+            mtime = log_file.stat().st_mtime
+        except OSError as exc:
+            result["errors"].append((str(log_file), f"stat: {exc}"))
+            continue
+        if mtime < cutoff:
+            try:
+                log_file.unlink()
+                result["deleted"].append(str(log_file))
+            except OSError as exc:
+                result["errors"].append((str(log_file), f"unlink: {exc}"))
+        else:
+            result["kept"].append(str(log_file))
+
+    return result

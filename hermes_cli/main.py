@@ -11837,6 +11837,27 @@ def cmd_logs(args):
         list_logs()
         return
 
+    if log_name == "prune":
+        from hermes_logging import prune_old_logs
+        from hermes_constants import get_hermes_home
+
+        override_days = getattr(args, "days", None)
+        result = prune_old_logs(
+            get_hermes_home() / "logs",
+            retention_days=override_days,
+        )
+        print(
+            f"prune: scanned {result['scanned']} file(s), "
+            f"deleted {len(result['deleted'])}, "
+            f"kept {len(result['kept'])}, "
+            f"retention {result['retention_days']} day(s)"
+        )
+        if result["errors"]:
+            print(f"  {len(result['errors'])} error(s) during sweep:")
+            for path, err in result["errors"][:10]:
+                print(f"    {path}: {err}")
+        return
+
     tail_log(
         log_name,
         num_lines=getattr(args, "lines", 50),

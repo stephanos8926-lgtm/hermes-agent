@@ -34,13 +34,15 @@ Examples:
     hermes logs --since 1h         Lines from the last hour
     hermes logs --since 30m -f     Follow, starting from 30 min ago
     hermes logs list               List available log files with sizes
+    hermes logs prune              Delete log files older than logging.log_retention_days
+    hermes logs prune --days 7     Override retention to 7 days for this run
 """,
     )
     logs_parser.add_argument(
         "log_name",
         nargs="?",
         default="agent",
-        help="Log to view: agent (default), errors, gateway, gui, or 'list' to show available files",
+        help="Log to view: agent (default), errors, gateway, gui, 'list' to show available files, or 'prune' to run retention",
     )
     logs_parser.add_argument(
         "-n",
@@ -74,5 +76,11 @@ Examples:
         "--component",
         metavar="NAME",
         help="Filter by component: gateway, agent, tools, cli, cron, gui",
+    )
+    logs_parser.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help="For 'prune': override the configured log_retention_days with N",
     )
     logs_parser.set_defaults(func=cmd_logs)
