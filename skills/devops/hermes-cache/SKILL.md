@@ -161,3 +161,6 @@ isn't justified at this scale.
 - `plugins/disk-cleanup/` — handles file-system hygiene (logs, backups,
   tracked files) for the cache filesystem; v3.1.0+ respects
   `cache.enabled` to avoid pruning cache files when the cache is active.
+- **docs/operations/extempfail-sentinel.md** — why gateway exit code 75
+  is correct, not a bug. If you see `TEMPFAIL` in the gateway logs,
+  that is the gateway announcing an intentional drain-and-restart.

@@ -19,6 +19,12 @@ Surfaced from existing `hermes_state.py` primitives (`repair_state_db_schema`,
 `quarantine_zeroed_state_db`, `collect_state_db_stats`) plus a local LCM-DB
 integrity check. Read-only by default; explicit opt-in for write actions.
 
+## See Also
+
+- `hermes-cache` — the in-process LRU + mmap tiered cache infrastructure
+- `disk-cleanup` v3.1.0+ — auto-prune logs and rotate `.bak` files on session end
+- **docs/operations/extempfail-sentinel.md** — why gateway exit code 75 is correct, not a bug
+
 ## When to Use This Skill
 
 - state.db has grown past 1 GB and needs VACUUM
