@@ -1470,6 +1470,66 @@ def _get_context_cache_path() -> Path:
     return get_hermes_home() / "context_length_cache.yaml"
 
 
+# L1 in-process cache mirroring the on-disk context_length_cache.yaml.
+# Added in cache C2 to drop the YAML read+parse on every get_cached_context_length
+# call (which fires many times per turn via get_model_info). The YAML remains
+# the cross-process source of truth; the L1 is an acceleration layer.
+#
+# Configurable via cache.model_metadata.* (off by default). When the section
+# is absent the L1 is a tiny LRU(64) with no L2 / L3 involvement.
+# HERMES_CACHE_MODEL_METADATA_ENABLED env-var override is honored.
+#
+# The cache is best-effort: any L1 exception falls through to the YAML
+# source of truth, which is the same contract the YAML loader honors.
+def _get_context_cache_l1():
+    """Return the module-level L1 cache (lazy init, never raises).
+
+    The L1 is bounded by entry count (default 256) to bound RAM. Per the
+    InProcessLRUCache contract, eviction is LRU. The byte budget is set
+    to 8 MiB which comfortably holds 256 ``model@base_url`` keys plus
+    integer values.
+    """
+    global _CONTEXT_CACHE_L1
+    try:
+        if _CONTEXT_CACHE_L1 is None:
+            from agent._cache import InProcessLRUCache
+            try:
+                from hermes_cli.config import load_config_readonly
+                cfg = load_config_readonly() or {}
+                mm = (cfg.get("cache") or {}).get("model_metadata") or {}
+                max_entries = int(mm.get("l1_max_entries", 256))
+                max_bytes = int(mm.get("l1_max_bytes", 8 * 1024 * 1024))
+            except Exception:
+                max_entries, max_bytes = 256, 8 * 1024 * 1024
+            # Floor the bounds so a misconfigured config never creates a
+            # degenerate cache.
+            if max_entries < 1:
+                max_entries = 1
+            if max_bytes < 1024:
+                max_bytes = 1024
+            _CONTEXT_CACHE_L1 = InProcessLRUCache(
+                max_entries=max_entries,
+                max_bytes=max_bytes,
+            )
+    except Exception as e:
+        logger.debug("Failed to init context cache L1: %s", e)
+        _CONTEXT_CACHE_L1 = None
+    return _CONTEXT_CACHE_L1
+
+
+# ``None`` means "not yet initialized" — _get_context_cache_l1() will populate.
+_CONTEXT_CACHE_L1: Optional["InProcessLRUCache"] = None
+
+
+# Set of keys for which the most recent L1 invalidate attempt failed.
+# When a key is in this set, get_cached_context_length MUST skip the L1
+# and consult YAML directly. The set is cleared (per key) the moment a
+# get falls through to YAML, so it only ever blocks one read per failed
+# invalidate. This is the defensive layer that keeps a single
+# L1.invalidate() exception from resurrecting a stale value.
+_CONTEXT_L1_TOMBSTONES: set = set()
+
+
 def _load_context_cache() -> Dict[str, int]:
     """Load the model+provider -> context_length cache from disk."""
     path = _get_context_cache_path()
@@ -1512,8 +1572,26 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     if cache.get(key) == length:
-        return  # already stored
+        # Mirror the value to L1 so the next read doesn't have to consult
+        # the YAML at all. The disk write is skipped because the value
+        # is already persisted.
+        l1 = _get_context_cache_l1()
+        if l1 is not None:
+            try:
+                l1.put(key, length)
+            except Exception as e:
+                logger.debug("L1 put (no-op path) failed: %s", e)
+        return
     cache[key] = length
+    # Write-through to L1 BEFORE the disk write so a concurrent reader
+    # never sees L1-empty + disk-pending. The disk write is the source
+    # of truth; L1 just shadows it.
+    l1 = _get_context_cache_l1()
+    if l1 is not None:
+        try:
+            l1.put(key, length)
+        except Exception as e:
+            logger.debug("L1 put failed: %s", e)
     path = _get_context_cache_path()
     try:
         # Atomic write (temp file + fsync + os.replace): a plain truncating
@@ -1531,9 +1609,42 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
 def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     """Look up a previously discovered context length for model+provider."""
     key = _context_cache_key(model, base_url)
+    # L1 fast path (cache C2): the LRU mirror means the common case is
+    # a hash-table lookup instead of a YAML read+parse. L1 hit returns
+    # immediately. The L1 is best-effort; any exception falls through.
+    #
+    # If the most recent L1 invalidate attempt failed, the key is in
+    # _CONTEXT_L1_TOMBSTONES — we MUST skip L1 here and consult YAML
+    # directly so a stale value cannot leak out of a broken invalidate.
+    # The tombstone is cleared as soon as we fall through, so it only
+    # blocks one read.
+    l1 = _get_context_cache_l1()
+    tombstoned = key in _CONTEXT_L1_TOMBSTONES
+    if l1 is not None and not tombstoned:
+        try:
+            hit = l1.get(key)
+            if hit is not None:
+                return int(hit)
+        except Exception as e:
+            logger.debug("L1 get failed, falling through to YAML: %s", e)
     cache = _load_context_cache()
+    # We fell through to YAML — clear the tombstone if any, and the L1
+    # entry we are about to repopulate is fresh.
+    if tombstoned:
+        try:
+            _CONTEXT_L1_TOMBSTONES.discard(key)
+        except Exception:
+            pass
     hit = cache.get(key)
     if hit is not None:
+        # Repopulate L1 so the next call hits. A single fall-through
+        # should fully recover the L1 — there is no reason to keep
+        # # consulting YAML once the L1 has seen a value.
+        if l1 is not None:
+            try:
+                l1.put(key, hit)
+            except Exception as e:
+                logger.debug("L1 repopulate failed: %s", e)
         return hit
     # Legacy rows written before key normalization may carry a trailing
     # slash — honor them rather than re-probing. Checked regardless of the
@@ -1544,6 +1655,21 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
         if legacy_key != key:
             hit = cache.get(legacy_key)
             if hit is not None:
+                # Repopulate the canonical key in both L1 and YAML so the
+                # next read uses the normalized form. The legacy row stays
+                # in YAML for compatibility (other processes may still
+                # hold the slashed form).
+                if l1 is not None:
+                    try:
+                        l1.put(key, hit)
+                    except Exception as e:
+                        logger.debug("L1 repopulate (legacy) failed: %s", e)
+                try:
+                    cache[key] = hit
+                    path = _get_context_cache_path()
+                    atomic_yaml_write(path, {"context_lengths": cache})
+                except Exception as e:
+                    logger.debug("YAML legacy repopulate failed: %s", e)
                 return hit
     return None
 
@@ -1551,6 +1677,26 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
     key = _context_cache_key(model, base_url)
+    # Invalidate L1 first so a concurrent reader cannot resurrect the
+    # value we are about to drop from YAML. Best-effort: an L1
+    # exception here does not block the YAML invalidation.
+    l1 = _get_context_cache_l1()
+    if l1 is not None:
+        try:
+            l1.invalidate(key)
+        except Exception as e:
+            # If the L1 invalidate itself fails, the L1 may still hold
+            # the value — which would mean the next get serves the
+            # stale value from L1 without consulting YAML. We mark the
+            # key as "tombstoned" so the next get_cached_context_length
+            # call skips L1 entirely for this key. The tombstone is
+            # cleared as soon as the get falls through to YAML, so it
+            # only ever blocks one read.
+            logger.debug("L1 invalidate failed, tombstoning key: %s", e)
+            try:
+                _CONTEXT_L1_TOMBSTONES.add(key)
+            except Exception:
+                pass
     cache = _load_context_cache()
     # Invalidation must also drop the in-memory TTL probe entries for this
     # pair — otherwise the next resolution inside the TTL window reuses the
