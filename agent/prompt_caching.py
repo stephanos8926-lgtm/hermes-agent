@@ -478,8 +478,14 @@ def apply_anthropic_cache_control(
 
     breakpoints_used = 0
 
+    # NOTE: shallow top-level copy is sufficient at lines below — the cache
+    # marker setters (_apply_system_cache_markers / _apply_cache_marker) only
+    # write top-level keys (content, cache_control); any nested content parts
+    # are part dicts that aren't mutated by the marker placement, so a
+    # copy.deepcopy here is wasted work. Matches the pattern documented at the
+    # existing strip branch (line ~477: strip_anthropic_cache_control([dict(msg)])[0]).
     if messages[0].get("role") == "system":
-        messages[0] = copy.deepcopy(messages[0])
+        messages[0] = dict(messages[0])
         breakpoints_used = _apply_system_cache_markers(
             messages[0],
             marker,
@@ -495,7 +501,7 @@ def apply_anthropic_cache_control(
         and _can_carry_marker(messages[i], native_anthropic=native_anthropic)
     ]
     for idx in non_sys[-remaining:]:
-        messages[idx] = copy.deepcopy(messages[idx])
+        messages[idx] = dict(messages[idx])
         _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
 
     return messages
