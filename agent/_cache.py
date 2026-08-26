@@ -456,6 +456,7 @@ class InProcessLRUCache:
         self,
         max_entries: int = 256,
         max_bytes: Optional[int] = None,
+        value_max_bytes: Optional[int] = None,
     ) -> None:
         if int(max_entries) < 1:
             raise ValueError("max_entries must be >= 1")
@@ -466,6 +467,19 @@ class InProcessLRUCache:
             self._max_bytes = int(max_bytes)
         else:
             self._max_bytes = None
+        # I3 elephant guard: per-value ceiling. Defaults to the whole
+        # byte budget (a value larger than the budget can never fit).
+        # Operators may set it tighter via cache.l1.value_max_bytes to
+        # keep single entries from dominating the cache.
+        if value_max_bytes is not None:
+            vmb = int(value_max_bytes)
+            if vmb < 1:
+                raise ValueError("value_max_bytes must be >= 1")
+            if self._max_bytes is not None and vmb > self._max_bytes:
+                vmb = self._max_bytes
+            self._value_max_bytes: Optional[int] = vmb
+        else:
+            self._value_max_bytes = self._max_bytes
         # Adaptive sharding: tiny caches stay single-shard so eviction
         # order is trivially exact and lock overhead is zero-ish.
         if self._max_entries <= self._SINGLE_SHARD_MAX_ENTRIES:
@@ -513,7 +527,8 @@ class InProcessLRUCache:
         byte budget) are silently skipped and counted."""
         self._check_key(key)
         size = _LRUShard.size_of(key, value)
-        if self._max_bytes is not None and size > self._max_bytes:
+        ceiling = self._value_max_bytes
+        if ceiling is not None and size > ceiling:
             # Elephant guard: one value larger than the entire budget
             # can never fit; counting it would evict everything else.
             self.cache_skip_oversized += 1
@@ -628,6 +643,7 @@ class InProcessLRUCache:
             "cache_skip_oversized": self.cache_skip_oversized,
             "max_entries": self._max_entries,
             "max_bytes": self._max_bytes,
+            "value_max_bytes": self._value_max_bytes,
             "num_shards": self._num_shards,
         }
 
@@ -1557,10 +1573,13 @@ def build_cache_from_config() -> TieredCache:
     if is_l1_enabled():
         cfg = _read_cache_config()
         l1 = cfg.get("l1", {})
-        tiers.append(InProcessLRUCache(
+        l1_kwargs = dict(
             max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
             max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
-        ))
+        )
+        if l1.get("value_max_bytes") is not None:
+            l1_kwargs["value_max_bytes"] = int(l1["value_max_bytes"])
+        tiers.append(InProcessLRUCache(**l1_kwargs))
     l2 = _build_l2_from_config()
     if l2 is not None:
         tiers.append(l2)

@@ -1268,3 +1268,63 @@ class TestShardedFlatFile:
             assert k in st, f"missing stats key {k}"
         assert st["backend"] == "flat_file"
         c.close()
+
+
+# ---------------------------------------------------------------------------
+# I3: elephant guard — value_max_bytes ceiling
+# ---------------------------------------------------------------------------
+class TestElephantGuard:
+    """I3: per-value ceiling, config wiring, boundary semantics."""
+
+    def test_default_ceiling_is_whole_budget(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=10, max_bytes=4096)
+        assert c._value_max_bytes == 4096
+
+    def test_tighter_ceiling_skips_midsize_values(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=10, max_bytes=65536,
+                              value_max_bytes=512)
+        c.put("small", "x" * 100)
+        assert c.get("small") is not None
+        before = c.cache_skip_oversized
+        c.put("mid", "x" * 2000)  # fits budget, exceeds ceiling
+        assert c.cache_skip_oversized == before + 1
+        assert c.get("mid") is None
+
+    def test_ceiling_capped_at_budget(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=10, max_bytes=1024,
+                              value_max_bytes=999999)
+        assert c._value_max_bytes == 1024
+
+    def test_ceiling_validation(self):
+        import pytest
+        from agent._cache import InProcessLRUCache
+        with pytest.raises(ValueError):
+            InProcessLRUCache(max_entries=10, value_max_bytes=0)
+
+    def test_boundary_value_equal_to_ceiling_is_allowed(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=10, max_bytes=8192,
+                              value_max_bytes=1024)
+        # size_of = len(key) + len(repr(value)); craft to land exactly on it.
+        v = "x" * (1024 - len("edge") - 2)  # repr adds 2 quotes
+        c.put("edge", v)
+        assert c.get("edge") is not None
+
+    def test_config_wiring_value_max_bytes(self, monkeypatch):
+        from agent import _cache as cache_mod
+        monkeypatch.setattr(
+            cache_mod, "_read_cache_config",
+            lambda: {"l1": {
+                "enabled": True,
+                "max_entries": 64,
+                "max_bytes": 1048576,
+                "value_max_bytes": 2048,
+            }},
+            raising=False,
+        )
+        router = cache_mod.build_cache_from_config()
+        l1 = router._tiers[0]
+        assert l1._value_max_bytes == 2048
