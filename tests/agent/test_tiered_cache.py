@@ -1078,3 +1078,99 @@ def test_build_l3_returns_sqlite_stub_when_backend_is_sqlite():
         with pytest.raises(NotImplementedError):
             _build_l3_from_config()
 
+
+
+# ---------------------------------------------------------------------------
+# I1: per-shard locking — aggregate semantics + shard distribution
+# ---------------------------------------------------------------------------
+class TestShardedLocking:
+    """I1: sharded InProcessLRUCache preserves aggregate budgets exactly."""
+
+    def test_multi_shard_created_for_large_caches(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=1000)
+        assert c._num_shards == 16
+
+    def test_single_shard_for_small_caches(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=64)
+        assert c._num_shards == 1
+
+    def test_aggregate_entry_budget_across_shards(self):
+        """800 keys spread over 16 shards must respect the 1000-entry
+        global budget with ZERO evictions (hash skew must not cause
+        premature per-shard eviction)."""
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=1000)
+        for i in range(800):
+            c.put(f"key-{i}", i)
+        assert len(c) == 800
+        assert c.evictions == 0
+
+    def test_global_lru_eviction_across_shards(self):
+        """The globally-oldest entry is evicted even when it lives in a
+        different shard than the most recent puts."""
+        import hashlib
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=500)
+        # Find two keys in different shards.
+        def shard_of(k):
+            return hashlib.sha256(k.encode()).digest()[0] % 16
+        k_old = k_new = None
+        for i in range(200):
+            if shard_of(f"old-{i}") != shard_of("anchor"):
+                k_old = f"old-{i}"
+                break
+        for i in range(200):
+            if shard_of(f"new-{i}") not in (shard_of("anchor"), shard_of(k_old)):
+                k_new = f"new-{i}"
+                break
+        assert k_old and k_new and shard_of(k_old) != shard_of(k_new)
+        c.put(k_old, "v")
+        for i in range(499):
+            c.put(f"filler-{i}", i)
+        assert len(c) == 500
+        # One more put forces eviction of the globally-oldest = k_old.
+        c.put("trigger", 1)
+        assert len(c) == 500
+        assert c.get(k_old) is None          # evicted (oldest)
+        assert c.get("filler-0") is not None  # newer, survives
+
+    def test_stats_reports_num_shards(self):
+        from agent._cache import InProcessLRUCache
+        s16 = InProcessLRUCache(max_entries=128).stats()
+        s1 = InProcessLRUCache(max_entries=32).stats()
+        assert s16["num_shards"] == 16
+        assert s1["num_shards"] == 1
+
+    def test_shard_selection_is_stable_across_instances(self):
+        """sha256-based selection: same key -> same shard index in any
+        instance/process (PYTHONHASHSEED-independent)."""
+        from agent._cache import InProcessLRUCache
+        a = InProcessLRUCache(max_entries=1000)
+        b = InProcessLRUCache(max_entries=1000)
+        for k in ("alpha", "beta", "gamma", "x" * 300):
+            assert a._shard_index(k) == b._shard_index(k)
+
+    def test_concurrent_puts_no_loss_under_budget(self):
+        """8 threads x 100 distinct keys into a 1000-entry cache:
+        all 800 keys present, zero evictions."""
+        import threading
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=1000)
+        def worker(tid):
+            for i in range(100):
+                c.put(f"t{tid}-k{i}", i)
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert len(c) == 800
+        assert c.evictions == 0
+
+    def test_oversized_put_skipped_and_counted(self):
+        from agent._cache import InProcessLRUCache
+        c = InProcessLRUCache(max_entries=10, max_bytes=1024)
+        before = c.cache_skip_oversized
+        c.put("huge", "x" * 4096)
+        assert c.cache_skip_oversized == before + 1
+        assert len(c) == 0

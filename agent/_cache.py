@@ -143,6 +143,9 @@ import struct
 import sys
 import tempfile
 import threading
+import logging
+
+logger = logging.getLogger(__name__)
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -356,53 +359,31 @@ def is_l3_enabled() -> bool:
 # L1 — InProcessLRUCache
 # ---------------------------------------------------------------------------
 
-class InProcessLRUCache:
-    """In-process LRU cache with both an entry-count and byte budget.
+class _LRUShard:
+    """One LRU shard: its own OrderedDict and lock.
 
-    The cache is keyed on the user-supplied string ``key`` and stores
-    the user-supplied value. Eviction policy is **LRU on entry count**
-    with a **secondary byte budget** that fires when the total cached
-    bytes exceed ``max_bytes`` (counting the sum of ``len(key)`` plus
-    the ``len(repr(value))`` for the stored value).
+    Entries are stored as ``(stamp, value)`` tuples where *stamp* is a
+    monotonically increasing integer assigned by the owning
+    :class:`InProcessLRUCache`. The stamp enables exact global-LRU
+    eviction across shards without a shared hot lock on every access:
+    the facade only needs the minimum stamp per shard to find the
+    globally-oldest entry.
 
-    **Configuration**: when constructed via :func:`build_cache_from_config`
-    (the recommended entry point), ``max_entries`` and ``max_bytes`` come
-    from the ``cache.l1.*`` config keys. When constructed directly,
-    defaults are used and can be overridden as constructor kwargs.
-
-    **Concurrency**: a single ``threading.RLock`` guards both the
-    OrderedDict and the byte counter. This is sufficient for the
-    expected workload (a handful of cache hits per turn, low
-    contention). For high-contention paths, consider ``OrderedDict``
-    with a finer-grained lock or a concurrent implementation.
-
-    **Byte-stability contract**: callers MUST treat the returned
-    value as read-only. The L1 cache returns the *exact object*
-    stored under the key, not a copy. Mutating a returned value
-    silently corrupts the cache and may invalidate the provider-side
-    prompt cache on the next read.
+    Budget enforcement lives in the facade (aggregate semantics);
+    shards are pure storage + locking.
     """
 
-    def __init__(
-        self,
-        max_entries: int = DEFAULT_L1_MAX_ENTRIES,
-        max_bytes: int = DEFAULT_L1_MAX_BYTES,
-    ) -> None:
-        if max_entries < 1:
-            raise ValueError("max_entries must be >= 1")
-        if max_bytes < 1024:
-            raise ValueError("max_bytes must be >= 1024")
-        self._max_entries = max_entries
-        self._max_bytes = max_bytes
-        self._entries: "OrderedDict[str, Any]" = OrderedDict()
-        self._bytes = 0
-        self._lock = threading.RLock()
-        # Stats — exposed for tests and operational debugging.
+    __slots__ = ("entries", "lock", "hits", "misses")
+
+    def __init__(self) -> None:
+        # key -> (stamp, value)
+        self.entries: "OrderedDict[str, tuple]" = OrderedDict()
+        self.lock = threading.RLock()
         self.hits = 0
         self.misses = 0
-        self.evictions = 0
 
-    def _size_of(self, key: str, value: Any) -> int:
+    @staticmethod
+    def size_of(key: str, value: Any) -> int:
         """Estimate the byte cost of storing *value* under *key*."""
         try:
             return len(key) + len(repr(value))
@@ -411,109 +392,250 @@ class InProcessLRUCache:
             # a coarse estimate that still bounds memory growth.
             return len(key) + 1024
 
-    def _evict_until_within_budget(self) -> None:
-        """Evict oldest entries until both budgets are satisfied."""
-        while (
-            len(self._entries) > self._max_entries
-            or self._bytes > self._max_bytes
-        ) and self._entries:
-            try:
-                oldest_key, oldest_value = next(iter(self._entries.items()))
-                self._entries.popitem(last=False)
-            except (KeyError, RuntimeError, StopIteration):
-                break
-            self._bytes -= self._size_of(oldest_key, oldest_value)
-            self.evictions += 1
-
     def get(self, key: str) -> Optional[Any]:
-        """Return the cached value for *key* and mark it as most-recently used.
+        try:
+            _stamp, value = self.entries[key]  # raises KeyError on miss
+        except KeyError:
+            self.misses += 1
+            return None
+        # Mark as most-recently used.
+        self.entries.move_to_end(key)
+        self.hits += 1
+        return value
 
-        Returns ``None`` on miss. The returned value is the **exact
-        object** stored under *key* — do not mutate it.
+    def put(self, key: str, value: Any, stamp: int) -> None:
+        self.entries[key] = (stamp, value)
+        self.entries.move_to_end(key)
+
+    def invalidate(self, key: str) -> bool:
+        """Remove *key*. Returns True if it was present."""
+        return self.entries.pop(key, None) is not None
+
+    def oldest(self) -> Optional[tuple]:
+        """Return ``(stamp, key)`` of the least-recently-used entry,
+        or ``None`` if empty. Cheap: the OrderedDict's first item."""
+        if not self.entries:
+            return None
+        key, (stamp, _value) = next(iter(self.entries.items()))
+        return (stamp, key)
+
+
+class InProcessLRUCache:
+    """Thread-safe in-process LRU cache with per-shard locking.
+
+    Storage is split across ``_num_shards`` independent shards, each
+    guarded by its own :class:`threading.RLock`. Operations on distinct
+    keys that hash to different shards proceed without contending on a
+    shared monitor — the canonical striped-lock pattern (Caffeine,
+    warp_cache, CacheLite).
+
+    **Aggregate budget semantics are preserved exactly**: ``max_entries``
+    and ``max_bytes`` bound the *total* population, not any single
+    shard. Eviction is exact global LRU via monotonic stamps: after each
+    put, if either aggregate budget is exceeded, the entry with the
+    smallest stamp across all shards is evicted (repeatedly, until the
+    totals fit). On the single-shard path this degenerates to plain
+    OrderedDict LRU and is byte-identical to the pre-sharding behavior.
+
+    Shard selection uses ``sha256(key) % num_shards`` — deliberately
+    NOT Python's builtin ``hash()``, whose value is randomized per
+    process by PYTHONHASHSEED (breaking stable shard assignment for
+    any persistent tier keyed alongside it).
+
+    Adaptive sharding: caches configured at or below
+    ``_SINGLE_SHARD_MAX_ENTRIES`` entries use exactly one shard, which
+    both avoids pointless lock overhead on tiny caches and preserves
+    the historical exact-eviction-order contract that small-cache unit
+    tests rely on.
+    """
+
+    _SHARD_COUNT = 16
+    _SINGLE_SHARD_MAX_ENTRIES = 64
+
+    def __init__(
+        self,
+        max_entries: int = 256,
+        max_bytes: Optional[int] = None,
+    ) -> None:
+        if int(max_entries) < 1:
+            raise ValueError("max_entries must be >= 1")
+        self._max_entries = int(max_entries)
+        if max_bytes is not None:
+            if int(max_bytes) < 1024:
+                raise ValueError("max_bytes must be >= 1024")
+            self._max_bytes = int(max_bytes)
+        else:
+            self._max_bytes = None
+        # Adaptive sharding: tiny caches stay single-shard so eviction
+        # order is trivially exact and lock overhead is zero-ish.
+        if self._max_entries <= self._SINGLE_SHARD_MAX_ENTRIES:
+            self._num_shards = 1
+        else:
+            self._num_shards = self._SHARD_COUNT
+        self._shards = [_LRUShard() for _ in range(self._num_shards)]
+        # Guards stamp allocation + aggregate counters only; never held
+        # during shard get/put, so it is not a hot-path bottleneck.
+        self._meta_lock = threading.Lock()
+        self._stamp = 0
+        self._total_entries = 0
+        self._total_bytes = 0
+        self.evictions = 0
+        self.cache_skip_oversized = 0
+
+    # -- shard selection ---------------------------------------------------
+
+    def _shard_index(self, key: str) -> int:
+        """Map *key* to its shard index.
+
+        Uses sha256 rather than builtin hash(): PYTHONHASHSEED randomizes
+        str hashing per process, which would make shard assignment differ
+        between processes sharing an L2 file keyed by shard index.
         """
+        digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
+        return digest[0] % self._num_shards
+
+    def _shard_for(self, key: str) -> "_LRUShard":
+        return self._shards[self._shard_index(key)]
+
+    # -- core operations ----------------------------------------------------
+
+    @staticmethod
+    def _check_key(key: str) -> None:
         if not isinstance(key, str):
-            raise TypeError(f"key must be str, got {type(key).__name__}")
-        with self._lock:
-            try:
-                value = self._entries[key]  # raises KeyError on miss
-            except KeyError:
-                self.misses += 1
-                return None
-            # Mark as most-recently used.
-            self._entries.move_to_end(key)
-            self.hits += 1
-            return value
+            raise TypeError("cache keys must be str")
+
+    def get(self, key: str):
+        self._check_key(key)
+        return self._shard_for(key).get(key)
 
     def put(self, key: str, value: Any) -> None:
-        """Store *value* under *key*, replacing any existing entry.
+        """Insert or update *key*. Oversized puts (larger than the whole
+        byte budget) are silently skipped and counted."""
+        self._check_key(key)
+        size = _LRUShard.size_of(key, value)
+        if self._max_bytes is not None and size > self._max_bytes:
+            # Elephant guard: one value larger than the entire budget
+            # can never fit; counting it would evict everything else.
+            self.cache_skip_oversized += 1
+            logger.debug(
+                "InProcessLRUCache: skipping oversized put (%d bytes > "
+                "budget %d)", size, self._max_bytes,
+            )
+            return False
 
-        Eviction fires if the new total exceeds the entry count or
-        byte budget. Existing keys retain their position in the LRU
-        (move_to_end is called for the new value).
+        shard = self._shard_for(key)
+        with self._meta_lock:
+            self._stamp += 1
+            stamp = self._stamp
+        had_key = False
+        old_size = 0
+        with shard.lock:
+            existing = shard.entries.get(key)
+            if existing is not None:
+                had_key = True
+                old_size = _LRUShard.size_of(key, existing[1])
+            shard.put(key, value, stamp)
+        with self._meta_lock:
+            if had_key:
+                self._total_bytes -= old_size
+            else:
+                self._total_entries += 1
+            self._total_bytes += size
+            self._evict_to_budget()
+
+    def _evict_to_budget(self) -> None:
+        """Evict globally-oldest entries until aggregate budgets fit.
+
+        Caller must hold ``self._meta_lock``. Exactness: stamps are
+        assigned under the meta lock, so the minimum-stamp entry is the
+        true global LRU head even though storage is sharded.
         """
-        if not isinstance(key, str):
-            raise TypeError(f"key must be str, got {type(key).__name__}")
-        cost = self._size_of(key, value)
-        with self._lock:
-            # If the key exists, subtract the old cost so the byte
-            # counter stays accurate after replacement.
-            if key in self._entries:
-                try:
-                    old_value = self._entries[key]
-                except KeyError:
-                    old_value = None
-                self._bytes -= self._size_of(key, old_value)
-            self._entries[key] = value
-            self._bytes += cost
-            self._entries.move_to_end(key)
-            self._evict_until_within_budget()
+        while True:
+            over_entries = self._total_entries > self._max_entries
+            over_bytes = (
+                self._max_bytes is not None
+                and self._total_bytes > self._max_bytes
+            )
+            if not (over_entries or over_bytes):
+                return
+            # Find the shard holding the globally-oldest entry.
+            best_shard = None
+            best_stamp = None
+            for shard in self._shards:
+                with shard.lock:
+                    oldest = shard.oldest()
+                    if oldest is not None and (
+                        best_stamp is None or oldest[0] < best_stamp
+                    ):
+                        best_stamp = oldest[0]
+                        best_shard = shard
+            if best_shard is None:
+                return  # nothing left to evict (defensive)
+            with best_shard.lock:
+                oldest = best_shard.oldest()
+                if oldest is None:
+                    continue
+                _stamp, victim_key = oldest
+                entry = best_shard.entries.pop(victim_key)
+                victim_size = _LRUShard.size_of(victim_key, entry[1])
+            self._total_entries -= 1
+            self._total_bytes -= victim_size
+            self.evictions += 1
 
     def invalidate(self, key: str) -> None:
-        """Remove *key* from the cache. No-op if the key is absent."""
-        if not isinstance(key, str):
-            raise TypeError(f"key must be str, got {type(key).__name__}")
-        with self._lock:
-            try:
-                old_value = self._entries.pop(key)
-            except KeyError:
-                return
-            self._bytes -= self._size_of(key, old_value)
+        self._check_key(key)
+        shard = self._shard_for(key)
+        with shard.lock:
+            existing = shard.entries.pop(key, None)
+        if existing is None:
+            return
+        with self._meta_lock:
+            self._total_entries -= 1
+            self._total_bytes -= _LRUShard.size_of(key, existing[1])
 
     def clear(self) -> None:
-        """Drop all entries and reset the byte counter to zero."""
-        with self._lock:
-            self._entries.clear()
-            self._bytes = 0
+        for shard in self._shards:
+            with shard.lock:
+                shard.entries.clear()
+        with self._meta_lock:
+            self._total_entries = 0
+            self._total_bytes = 0
 
     def __len__(self) -> int:
-        with self._lock:
-            return len(self._entries)
+        total = 0
+        for shard in self._shards:
+            with shard.lock:
+                total += len(shard.entries)
+        return total
 
-    def __contains__(self, key: object) -> bool:
-        if not isinstance(key, str):
-            return False
-        with self._lock:
-            return key in self._entries
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not None
 
     def stats(self) -> dict:
-        """Return a snapshot of cache statistics for tests and observability."""
-        with self._lock:
-            total = self.hits + self.misses
-            return {
-                "entries": len(self._entries),
-                "bytes": self._bytes,
-                "hits": self.hits,
-                "misses": self.misses,
-                "hit_rate": (self.hits / total) if total else 0.0,
-                "evictions": self.evictions,
-                "max_entries": self._max_entries,
-                "max_bytes": self._max_bytes,
-            }
+        hits = misses = 0
+        for shard in self._shards:
+            with shard.lock:
+                hits += shard.hits
+                misses += shard.misses
+        total = hits + misses
+        return {
+            "entries": len(self),
+            "bytes": self._total_bytes,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (hits / total) if total else 0.0,
+            "evictions": self.evictions,
+            "cache_skip_oversized": self.cache_skip_oversized,
+            "max_entries": self._max_entries,
+            "max_bytes": self._max_bytes,
+            "num_shards": self._num_shards,
+        }
 
+    # Back-compat alias used by earlier callers/tests.
+    @property
+    def max_entries(self) -> int:
+        return self._max_entries
 
-# ---------------------------------------------------------------------------
-# L2 — flat_file (real, stdlib-only) and redis (stub)
-# ---------------------------------------------------------------------------
 
 class FlatFileCache:
     """L2 cache — memory-mapped ring buffer. **Stdlib only.**
