@@ -1174,3 +1174,97 @@ class TestShardedLocking:
         c.put("huge", "x" * 4096)
         assert c.cache_skip_oversized == before + 1
         assert len(c) == 0
+
+
+# ---------------------------------------------------------------------------
+# I2: sharded mmap FlatFileCache
+# ---------------------------------------------------------------------------
+class TestShardedFlatFile:
+    """I2: sharded mmap L2 — shard count, isolation, legacy retirement."""
+
+    def test_multi_shard_for_large_budget(self, tmp_path):
+        from agent._cache import FlatFileCache
+        c = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=64 * 1024 * 1024)
+        assert c._num_shards == 16
+        c.close()
+
+    def test_single_shard_for_small_budget(self, tmp_path):
+        from agent._cache import FlatFileCache
+        c = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+        assert c._num_shards == 1
+        c.close()
+
+    def test_roundtrip_and_persistence(self, tmp_path):
+        import os
+        from agent._cache import FlatFileCache
+        p = str(tmp_path / "l2.mmap")
+        c = FlatFileCache(path=p, max_bytes=64 * 1024 * 1024)
+        c.put("alpha", {"v": 1})
+        assert c.get("alpha") == {"v": 1}
+        c.close()
+        # Reopen: entries persist in per-shard files.
+        c2 = FlatFileCache(path=p, max_bytes=64 * 1024 * 1024)
+        assert c2.get("alpha") == {"v": 1}
+        c2.close()
+
+    def test_shard_files_created(self, tmp_path):
+        import os
+        from agent._cache import FlatFileCache
+        p = str(tmp_path / "l2.mmap")
+        c = FlatFileCache(path=p, max_bytes=64 * 1024 * 1024)
+        c.put("k", "v")
+        c.close()
+        shards = [f for f in os.listdir(tmp_path) if ".s" in f]
+        assert len(shards) == 16
+
+    def test_legacy_file_retired_once(self, tmp_path):
+        import os
+        from agent._cache import FlatFileCache
+        p = str(tmp_path / "l2.mmap")
+        # Simulate a pre-sharding single file with content.
+        with open(p, "wb") as f:
+            f.write(b"\x00" * 4096)
+        c = FlatFileCache(path=p, max_bytes=64 * 1024 * 1024)
+        c.close()
+        assert os.path.exists(p + ".legacy")
+        assert not os.path.exists(p) or os.path.getsize(p) == 0
+
+    def test_stable_shard_selection(self, tmp_path):
+        """Same key -> same shard INDEX across instances (sha256, not
+        hash()); PYTHONHASHSEED-independent."""
+        import hashlib
+        from agent._cache import FlatFileCache
+        a = FlatFileCache(path=str(tmp_path / "a.mmap"), max_bytes=64 * 1024 * 1024)
+        b = FlatFileCache(path=str(tmp_path / "b.mmap"), max_bytes=64 * 1024 * 1024)
+
+        def idx_of(cache, k):
+            # Derive index from which shard file the key maps to.
+            return int(str(cache._shard_for(k)._path).rsplit(".s", 1)[1].split(".")[0])
+
+        for k in ("x", "y", "z" * 500):
+            assert idx_of(a, k) == idx_of(b, k)
+            assert idx_of(a, k) == (
+                hashlib.sha256(k.encode("utf-8", "surrogatepass")).digest()[0] % 16
+            )
+        a.close()
+        b.close()
+
+    def test_typeerror_on_non_str_key(self, tmp_path):
+        import pytest
+        from agent._cache import FlatFileCache
+        c = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=64 * 1024 * 1024)
+        with pytest.raises(TypeError):
+            c.get(123)
+        with pytest.raises(TypeError):
+            c.put(123, "v")
+        c.close()
+
+    def test_stats_contract_keys(self, tmp_path):
+        from agent._cache import FlatFileCache
+        c = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=64 * 1024 * 1024)
+        st = c.stats()
+        for k in ("backend", "path", "max_bytes", "hits", "misses",
+                  "evictions", "hit_rate", "num_shards"):
+            assert k in st, f"missing stats key {k}"
+        assert st["backend"] == "flat_file"
+        c.close()

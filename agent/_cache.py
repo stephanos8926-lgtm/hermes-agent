@@ -637,7 +637,7 @@ class InProcessLRUCache:
         return self._max_entries
 
 
-class FlatFileCache:
+class _FlatFileRing:
     """L2 cache — memory-mapped ring buffer. **Stdlib only.**
 
     The cache lives in a single fixed-size file at the configured path
@@ -1037,6 +1037,126 @@ def _build_l2_from_config() -> Optional[TieredCache]:
 # ---------------------------------------------------------------------------
 # L3 — sharded_file (real, stdlib-only) and sqlite (stub)
 # ---------------------------------------------------------------------------
+
+
+
+class FlatFileCache:
+    """Facade over N mmap ring shards, keyed by sha256(key)[0] % N.
+
+    Public API and constructor signature are identical to the original
+    single-ring ``FlatFileCache``. Each shard persists to its own file
+    (``<path>.s<i>``), so concurrent writers on different keys contend
+    on different files/flocks instead of one global ring.
+
+    Legacy layout: if a pre-sharding single file exists at *path*, it is
+    renamed to ``<path>.legacy`` exactly once and its entries are NOT
+    migrated -- the stored slots hold only 8-byte key hashes (not full
+    keys), so enumeration is impossible. L2 is an acceleration tier;
+    losing stale entries is acceptable (sources of truth live upstream).
+
+    Adaptive sharding: budgets < 4 MiB use a single shard (no pointless
+    extra files); larger budgets use 16.
+    """
+
+    _SHARD_COUNT = 16
+    _SINGLE_SHARD_MAX_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, path=None, max_bytes=64 * 1024 * 1024,
+                 _is_shard: bool = False, **kwargs):
+        if _is_shard:
+            # Internal: behave exactly like the original single ring.
+            self._ring = _FlatFileRing(path=path, max_bytes=max_bytes, **kwargs)
+            return
+        import os as _os
+        self._path = str(path)
+        if max_bytes is not None and int(max_bytes) < self._SINGLE_SHARD_MAX_BYTES:
+            self._num_shards = 1
+        else:
+            self._num_shards = self._SHARD_COUNT
+        # One-time legacy-layout retirement.
+        try:
+            if _os.path.exists(self._path) and _os.path.getsize(self._path) > 0:
+                legacy = self._path + ".legacy"
+                if not _os.path.exists(legacy):
+                    _os.replace(self._path, legacy)
+                    logger.warning(
+                        "FlatFileCache: retired legacy single-file L2 at %s "
+                        "(entries not migratable; renamed to %s)",
+                        self._path, legacy,
+                    )
+        except Exception:
+            logger.debug("FlatFileCache: legacy check failed", exc_info=True)
+        base, ext = _os.path.splitext(self._path)
+        self._shards = []
+        for i in range(self._num_shards):
+            shard_path = "%s.s%d%s" % (base, i, ext)
+            self._shards.append(
+                _FlatFileRing(path=shard_path, max_bytes=max_bytes, **kwargs)
+            )
+
+    def _shard_for(self, key: str) -> "_FlatFileRing":
+        digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
+        return self._shards[digest[0] % self._num_shards]
+
+    @staticmethod
+    def _check_key(key: str) -> None:
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+
+    def get(self, key: str):
+        self._check_key(key)
+        return self._shard_for(key).get(key)
+
+    def put(self, key: str, value) -> None:
+        self._check_key(key)
+        self._shard_for(key).put(key, value)
+
+    def invalidate(self, key: str) -> None:
+        self._check_key(key)
+        self._shard_for(key).invalidate(key)
+
+    def close(self) -> None:
+        for s in self._shards:
+            s.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __len__(self) -> int:
+        return sum(len(s) for s in self._shards)
+
+    def __contains__(self, key: str) -> bool:
+        return self._shard_for(key).__contains__(key)
+
+    def stats(self) -> dict:
+        agg = {
+            "backend": "flat_file",
+            "path": self._path,
+            "max_bytes": self._shards[0]._max_bytes if self._shards else None,
+            "num_shards": self._num_shards,
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "cache_skip_oversized": 0,
+        }
+        first = True
+        for s in self._shards:
+            st = s.stats()
+            for k in ("hits", "misses", "evictions", "cache_skip_oversized"):
+                agg[k] += st.get(k, 0)
+            if first:
+                # Ring-layout metadata is identical across shards.
+                agg["slot_count"] = st.get("slot_count")
+                agg["slot_value_max"] = st.get("slot_value_max")
+                agg["read_only"] = st.get("read_only")
+                first = False
+        total = agg["hits"] + agg["misses"]
+        agg["hit_rate"] = (agg["hits"] / total) if total else 0.0
+        return agg
+
 
 class ShardedFileCache:
     """L3 cache — sharded directory of files with mtime-based TTL.
