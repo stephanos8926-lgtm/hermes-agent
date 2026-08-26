@@ -3649,6 +3649,11 @@ def _gateway_config_home() -> Path:
     return _hermes_home
 
 
+# C5: memo for non-canonical gateway config reads (test fixtures,
+# multiplexed profile routes). Keyed on (path, mtime_ns, size); bounded.
+_NONCANONICAL_CFG_CACHE: "dict[tuple, dict]" = {}
+
+
 def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     """Load and parse a gateway config.yaml, returning {} on any error.
 
@@ -3679,11 +3684,26 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
         pass
 
     if not used_canonical:
+        # C5: non-canonical paths (test fixtures, multiplexed profiles)
+        # previously re-ran yaml.safe_load on EVERY gateway RPC. Memoize
+        # keyed on (path, mtime_ns, size) -- any file change produces a
+        # new key, so staleness is impossible. Mirrors the mtime-cache
+        # contract of hermes_cli.config.read_raw_config: callers must
+        # not mutate the returned dict (same rule as the canonical path).
         try:
-            if config_path.exists():
+            st = config_path.stat()
+            cache_key = (str(config_path), st.st_mtime_ns, st.st_size)
+            cached = _NONCANONICAL_CFG_CACHE.get(cache_key)
+            if cached is not None:
+                raw = cached
+            elif config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
                     raw = yaml.safe_load(f) or {}
+                _NONCANONICAL_CFG_CACHE[cache_key] = raw
+                # Bound the memo: distinct fixture/profile paths only.
+                while len(_NONCANONICAL_CFG_CACHE) > 8:
+                    _NONCANONICAL_CFG_CACHE.pop(next(iter(_NONCANONICAL_CFG_CACHE)))
         except Exception:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
