@@ -2357,6 +2357,96 @@ def load_soul_md(
         return None
 
 
+# ---------------------------------------------------------------------------
+# C7: L1 memo for context-file loaders
+#
+# build_context_files_prompt() fires on every turn and each loader walks
+# directories + reads files whose content rarely changes mid-session.
+# Memoize keyed on (loader, cwd, context_length, stat-signature) where the
+# signature covers every candidate file's (mtime_ns, size). Any edit,
+# rename, addition, or removal produces a new signature -> fresh read.
+# In-place edits change mtime_ns; coarse-mtime filesystems are covered by
+# including size. Bounded at 32 entries (FIFO).
+# ---------------------------------------------------------------------------
+_C7_CACHE: "OrderedDictType" = OrderedDict()
+_C7_CACHE_MAX = 32
+
+try:
+    from collections import OrderedDict as OrderedDictType
+except ImportError:  # pragma: no cover
+    OrderedDictType = dict
+
+
+def _c7_stat_sig(paths) -> tuple:
+    """(path, mtime_ns, size) for every path that exists."""
+    sig = []
+    for p in paths:
+        try:
+            st = p.stat()
+            sig.append((str(p), st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
+def _c7_cached(name: str, loader, cwd_path: Path,
+               context_length: Optional[int], candidates):
+    key = (name, str(cwd_path.resolve()), context_length,
+           _c7_stat_sig(candidates))
+    try:
+        hit = _C7_CACHE.get(key)
+        if hit is not None or key in _C7_CACHE:
+            return hit
+    except TypeError:  # unhashable (defensive)
+        return loader(cwd_path, context_length)
+    result = loader(cwd_path, context_length)
+    try:
+        _C7_CACHE[key] = result
+        while len(_C7_CACHE) > _C7_CACHE_MAX:
+            _C7_CACHE.pop(next(iter(_C7_CACHE)))
+    except Exception:
+        logger.debug("C7 cache store failed", exc_info=True)
+    return result
+
+
+def _load_hermes_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / n for n in [".hermes.md", "HERMES.md"]]
+    return _c7_cached("hermes_md", _load_hermes_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_agents_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    try:
+        chain = _agents_md_directory_chain(cwd_path)
+    except Exception:
+        chain = []
+    cands = [d / n for d in chain for n in ["AGENTS.md", "agents.md", "Agents.md"]]
+    return _c7_cached("agents_md", _load_agents_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_claude_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / n for n in ["CLAUDE.md", "claude.md"]]
+    return _c7_cached("claude_md", _load_claude_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_cursorrules_cached(cwd_path: Path,
+                             context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / ".cursorrules"]
+    rules_dir = cwd_path / ".cursor" / "rules"
+    if rules_dir.is_dir():
+        try:
+            cands.extend(sorted(rules_dir.glob("*.mdc")))
+        except Exception:
+            pass
+    return _c7_cached("cursorrules", _load_cursorrules, cwd_path,
+                      context_length, cands)
+
+
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
@@ -2579,10 +2669,10 @@ def build_context_files_prompt(
     else:
         # Priority-based project context: first match wins
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
+            _load_hermes_md_cached(cwd_path, context_length)
+            or _load_agents_md_cached(cwd_path, context_length)
+            or _load_claude_md_cached(cwd_path, context_length)
+            or _load_cursorrules_cached(cwd_path, context_length)
         )
     if project_context:
         sections.append(project_context)
