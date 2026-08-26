@@ -164,3 +164,27 @@ isn't justified at this scale.
 - **docs/operations/extempfail-sentinel.md** — why gateway exit code 75
   is correct, not a bug. If you see `TEMPFAIL` in the gateway logs,
   that is the gateway announcing an intentional drain-and-restart.
+
+## Round 3 Additions (I1–I3, C4)
+
+The cache infrastructure gained four capabilities this round:
+
+| Capability | Config key | Default | What it does |
+|---|---|---|---|
+| Per-shard locking (I1) | *(automatic)* | 16 shards ≥65 entries | Concurrent ops on different keys no longer contend on one lock. Small caches (≤64 entries) stay single-shard for exact LRU ordering. |
+| Sharded mmap L2 (I2) | *(automatic)* | 16 shards ≥4 MiB budget | Each shard persists to `<path>.s<i>`; concurrent writers hit different files/flocks. Legacy single-file layouts are renamed `.legacy` once on first open (entries not migratable — L2 is an acceleration tier). |
+| Elephant guard (I3) | `cache.l1.value_max_bytes` | `= max_bytes` | Per-value ceiling. Values larger than the ceiling are skipped and counted in `cache_skip_oversized`, even if they'd fit the overall budget. Use ~`max_bytes/4` to stop one giant tool output from evicting hundreds of hot entries. |
+| Agent-cache byte valve (C4) | `agent.agent_cache.max_bytes` | unset (disabled) | Aggregate byte budget for cached gateway agents. When set, transcripts are estimated and LRU-oldest evicted until under budget — the structural fix for the 250–440 MiB RSS climb. Count caps alone cannot bound bytes. |
+
+### Shard selection note
+
+Both sharded layers select via `sha256(key)[0] % num_shards` — deliberately
+NOT Python's builtin `hash()`, which PYTHONHASHSEED randomizes per process.
+Shard assignment is stable across processes and restarts.
+
+### Observability
+
+`stats()` on every layer now exposes: `num_shards`, `value_max_bytes`
+(L1), and aggregated `hits`/`misses`/`evictions`/`cache_skip_oversized`.
+Watch `cache_skip_oversized` — a rising count means values are being
+rejected; tune `value_max_bytes` or the tier budget accordingly.
