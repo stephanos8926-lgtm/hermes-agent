@@ -62,6 +62,10 @@ class AgentCacheBounds:
 
     max_size: Optional[int] = None
     idle_ttl_secs: Optional[float] = None
+    # C4 second valve: hard aggregate byte budget for cached transcripts.
+    # ``None`` disables it (prior behavior). Estimated per-agent, evicted
+    # LRU-oldest-first inside _enforce_agent_cache_cap().
+    max_bytes: Optional[int] = None
     memory_high_mb: Optional[int] = None
     max_evictions_per_pass: int = _DEFAULT_MAX_EVICTIONS_PER_PASS
     protect_recent: int = _DEFAULT_PROTECT_RECENT
@@ -214,6 +218,7 @@ def resolve_agent_cache_bounds(config: Any) -> AgentCacheBounds:
     return AgentCacheBounds(
         max_size=_positive_int(section.get("max_size")),
         idle_ttl_secs=_positive_float(section.get("idle_ttl_secs")),
+        max_bytes=_positive_int(section.get("max_bytes")),
         memory_high_mb=resolve_memory_high_mb(section.get("memory_high_mb", "auto")),
         max_evictions_per_pass=(
             max_evictions if max_evictions is not None else _DEFAULT_MAX_EVICTIONS_PER_PASS
