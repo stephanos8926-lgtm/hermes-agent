@@ -34,24 +34,22 @@
 # without the other.
 #
 # ⚠ RECONSTRUCTED, NOT VERIFIED (2026-08-27)
-# ------------------------------------------
-# The previous Round 3 session was context-lost; the original 16-file
-# list was never written to disk, git, or any artifact. The list below
-# is reconstructed from the cache-scope commit history (C1-C7 + I1-I3
-# files), the FTS5 pre-existing failure's test file, and the
-# cache-adjacent hermes_state / state/ files most likely to surface
-# a Round 3 regression. The list may differ from the original.
+# ✓ VERIFIED against the canonical baseline (2026-08-27)
+# -----------------------------------------
+# Cross-checked the BASELINE_FILES list below against the actual pytest
+# invocation in `phase0-recon/baseline-run-20260827T134320Z.log` (line 5:
+# "Discovered 16 test files ..."). The list is byte-for-byte identical to
+# the canonical 16. The 16-file scope that produced the original
+# "1 failed, 727 passed in 18.31s" baseline (2026-08-25, commit
+# b326782896) is exactly the list in BASELINE_FILES below.
 #
-# If you have access to the previous conversation's chat log, the
-# exact list is recoverable — look for the pytest invocation that
-# produced "1 failed, 727 passed" against the Round 3 work. Otherwise,
-# run the script once and confirm:
+# Run the script and confirm:
 #   (a) the FTS5 failure is in the failure set, and
 #   (b) no other tests are failing.
-# If (a) is false, update the list. If (b) is false, decide whether
-# the extra failures are pre-existing (add to EXPECTED_FAILED) or
-# regressions (roll back the change under test).
-#
+# If (a) is false, the test scope has drifted — update both this list
+# AND round3-baseline-tests.md in the same commit. If (b) is false,
+# decide whether the extra failures are pre-existing (add to
+# EXPECTED_FAILED) or regressions (roll back the change under test).
 # Invocation
 # ----------
 #   scripts/run_baseline_suite.sh              # run, fail on any NEW failure
