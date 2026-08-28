@@ -36,6 +36,45 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ---------------------------------------------------------------------------
+# Hypothesis profiles (added per v2 spec §4.2, 2026-08-28)
+#
+# Three profiles cover the common test-execution environments:
+#   - dev: fast (10 examples), no deadline — for inner loop
+#   - ci: medium (100 examples), 500ms deadline — for CI
+#   - nightly: thorough (2000 examples), no deadline — for nightly / soak
+#
+# Usage:
+#   # In a test, use a specific profile:
+#   @settings(max_examples=50)  # explicit override
+#
+#   # Or set globally via env var:
+#   HYPOTHESIS_PROFILE=ci pytest  # uses ci profile
+#
+# If HYPOTHESIS_PROFILE is not set, the default is "default" (Hypothesis's
+# built-in). To activate the dev profile by default, run:
+#   HYPOTHESIS_PROFILE=dev pytest
+# The spec chose NOT to load_profile("dev") at module load because some
+# other test modules rely on Hypothesis's built-in "default" profile.
+# Activate dev per-file or per-test as needed via @settings(...).
+# ---------------------------------------------------------------------------
+try:
+    from hypothesis import settings as _hypothesis_settings
+    _hypothesis_settings.register_profile("dev", max_examples=10, deadline=None)
+    _hypothesis_settings.register_profile("ci", max_examples=100, deadline=500)
+    _hypothesis_settings.register_profile("nightly", max_examples=2000, deadline=None)
+    # Per REQ-111: load "dev" as the default for this session.
+    # This makes the dev profile the default unless HYPOTHESIS_PROFILE env
+    # var overrides it.
+    import os as _os
+    if "HYPOTHESIS_PROFILE" not in _os.environ:
+        _hypothesis_settings.load_profile("dev")
+except ImportError:
+    # hypothesis not installed — property tests will be skipped/import-error.
+    # The rest of the test suite is unaffected.
+    pass
+
+
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
 # `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.

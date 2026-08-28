@@ -252,6 +252,24 @@ if [ "$BASELINE_RC" -eq 0 ] && [ "${#ACTUAL_FAILED[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# NOTE (2026-08-28): Replay-economy property tests (file:
+# tests/hermes_cli/test_replay_economy_properties.py) are NOT in the
+# canonical 16-file baseline scope. They are run separately as part
+# of CI and as a pre-commit hook. See the migration checklist in the
+# commit message that introduced them for the full rationale.
+#
+# Originally this script had a "post-baseline" step to run the
+# property tests here. That step was removed because the script's
+# pre-existing `set -euo pipefail` (line 81) causes the script to
+# abort on the first non-zero pipeline exit, which happens whenever
+# the canonical baseline's expected FTS5 failure is present. The
+# runner's exit code 1 triggers `set -e` BEFORE the script can read
+# `BASELINE_RC` and reach the post-baseline step. Fixing that bug
+# is a separate concern (and the prior session's "VERIFIED" commit
+# 25bb09c8d6 did not address it). Property tests can be invoked
+# directly via:
+#   .venv/bin/python -m pytest tests/hermes_cli/test_replay_economy_properties.py -q
+
 echo
 echo "✓ baseline preserved (1 expected failure, no regressions)"
 exit 0
