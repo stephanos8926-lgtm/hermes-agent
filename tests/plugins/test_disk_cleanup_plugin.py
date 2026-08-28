@@ -14,7 +14,9 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 
 import importlib
 import json
+import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -590,3 +592,373 @@ class TestV310SlashCommands:
         assert "prune-logs" in help_text
         assert "rotate-backups" in help_text
         assert "vacuum-dbs" in help_text
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 regression: SWEEP_ROOLS (inclusion-only) + age-gate
+# ---------------------------------------------------------------------------
+
+class TestSweepRoots:
+    """The old implementation used an inverted allowlist for empty-dir sweeping,
+    which caused backup trees (backup-from-prod, state-snapshots, ...) to be
+    touched when omitted from the allowlist.  Phase 1 replaces that with an
+    explicit inclusion set (_SWEEP_ROOTS) and an age-gate so only known
+    ephemeral roots are ever descended into.
+    """
+
+    def test_sweep_roots_constant(self, _isolate_env):
+        """_SWEEP_ROOTS must contain the three intended ephemeral roots."""
+        dg = _load_lib()
+        expected = {"cache", "cron/output", "disk-cleanup/staging"}
+        assert dg._SWEEP_ROOTS == expected
+
+    def test_sweep_only_touches_sweep_roots(self, _isolate_env):
+        """Empty dirs outside _SWEEP_ROOTS must never be swept."""
+        dg = _load_lib()
+        hermes_home = _isolate_env
+
+        inside = hermes_home / "cache" / "empty_sub"
+        inside.mkdir(parents=True)
+        outside = hermes_home / "backup-from-prod" / "empty_sub"
+        outside.mkdir(parents=True)
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        os.utime(inside, (old_ts, old_ts))
+        os.utime(outside, (old_ts, old_ts))
+
+        dg.quick()
+
+        assert not inside.exists(), "inside sweep root should be removed"
+        assert outside.exists(), "outside sweep root must NOT be removed"
+
+    def test_sweep_skips_fresh_empty_dirs(self, _isolate_env):
+        """Empty dirs younger than _MIN_EMPTY_DIR_AGE_DAYS must be kept."""
+        dg = _load_lib()
+        hermes_home = _isolate_env
+
+        fresh = hermes_home / "cache" / "fresh_empty"
+        fresh.mkdir(parents=True)
+
+        dg.quick()
+
+        assert fresh.exists(), "fresh empty dir must be kept"
+
+    def test_sweep_removes_old_empty_dirs(self, _isolate_env):
+        """Empty dirs older than _MIN_EMPTY_DIR_AGE_DAYS must be removed."""
+        dg = _load_lib()
+        hermes_home = _isolate_env
+
+        old = hermes_home / "cache" / "old_empty"
+        old.mkdir(parents=True)
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        os.utime(old, (old_ts, old_ts))
+
+        dg.quick()
+
+        assert not old.exists(), "old empty dir should be removed"
+
+    def test_sweep_never_touches_backup_trees(self, _isolate_env):
+        """All known backup/snapshot/app trees must be protected."""
+        dg = _load_lib()
+        hermes_home = _isolate_env
+
+        protected_trees = [
+            "backup-from-prod",
+            "state-snapshots",
+            "bin",
+            "image_cache",
+            "desktop-plugins",
+        ]
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+
+        for tree in protected_trees:
+            d = hermes_home / tree / "empty_sub"
+            d.mkdir(parents=True)
+            os.utime(d, (old_ts, old_ts))
+
+        dg.quick()
+
+        for tree in protected_trees:
+            d = hermes_home / tree / "empty_sub"
+            assert d.exists(), f"{tree} must not be swept"
+
+    def test_sweep_tmp_hermes_dirs(self, _isolate_env):
+        """Empty dirs under /tmp/hermes-* must be swept."""
+        dg = _load_lib()
+        tmp_dir = Path("/tmp") / f"hermes-test-sweep-{os.getpid()}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        empty = tmp_dir / "empty_sub"
+        empty.mkdir()
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        os.utime(empty, (old_ts, old_ts))
+
+        try:
+            dg.quick()
+            assert not empty.exists(), "/tmp/hermes-* empty dir should be swept"
+        finally:
+            if tmp_dir.exists():
+                import shutil
+                shutil.rmtree(tmp_dir)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 regression: quarantine (trash) — reversible deletion
+# ---------------------------------------------------------------------------
+
+class TestQuarantine:
+    """Files deleted by quick()/deep() must land in quarantine, not be
+    hard-deleted.  restore() and purge() must round-trip correctly.
+    """
+
+    def test_move_file_to_trash(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "test_remove.py"
+        p.write_text("x")
+
+        trash_id = dg._move_to_trash(p, "test", "quick-cleanup")
+        assert trash_id is not None
+        assert not p.exists()
+
+        trash_dir = dg.get_trash_dir() / trash_id
+        assert trash_dir.is_dir()
+        assert (trash_dir / "test_remove.py").exists()
+        manifest = json.loads((trash_dir / "manifest.json").read_text())
+        assert manifest["original_path"] == str(p.resolve())
+        assert manifest["category"] == "test"
+        assert manifest["reason"] == "quick-cleanup"
+        assert manifest["is_dir"] is False
+
+    def test_move_dir_to_trash(self, _isolate_env):
+        dg = _load_lib()
+        d = _isolate_env / "tmp_bundle"
+        d.mkdir()
+        (d / "file.txt").write_text("x")
+
+        trash_id = dg._move_to_trash(d, "temp", "quick-cleanup")
+        assert trash_id is not None
+        assert not d.exists()
+
+        trash_dir = dg.get_trash_dir() / trash_id
+        assert (trash_dir / "tmp_bundle").is_dir()
+        manifest = json.loads((trash_dir / "manifest.json").read_text())
+        assert manifest["is_dir"] is True
+
+    def test_move_to_trash_nonexistent_path(self, _isolate_env):
+        dg = _load_lib()
+        missing = _isolate_env / "does_not_exist.txt"
+        assert dg._move_to_trash(missing, "test", "quick") is None
+
+    def test_restore_file(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "restore_me.py"
+        p.write_text("x")
+        trash_id = dg._move_to_trash(p, "test", "quick-cleanup")
+        assert trash_id is not None
+
+        assert dg.restore(trash_id) is True
+        assert p.exists()
+        assert not (dg.get_trash_dir() / trash_id).exists()
+
+    def test_restore_missing_trash_id(self, _isolate_env):
+        dg = _load_lib()
+        assert dg.restore("nonexistent-id") is False
+
+    def test_restore_corrupt_manifest(self, _isolate_env):
+        dg = _load_lib()
+        trash_dir = dg.get_trash_dir() / "corrupt-id"
+        trash_dir.mkdir(parents=True)
+        (trash_dir / "manifest.json").write_text("not json")
+        assert dg.restore("corrupt-id") is False
+
+    def test_purge_removes_old_entries(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "old_file.txt"
+        p.write_text("x")
+        trash_id = dg._move_to_trash(p, "test", "quick-cleanup")
+        assert trash_id is not None
+
+        # Back-date the manifest timestamp by 40 days.
+        manifest_path = dg.get_trash_dir() / trash_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        manifest["timestamp"] = old_ts
+        manifest_path.write_text(json.dumps(manifest))
+
+        purged = dg.purge(older_than_days=30)
+        assert purged == 1
+        assert not (dg.get_trash_dir() / trash_id).exists()
+
+    def test_purge_keeps_recent_entries(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "recent_file.txt"
+        p.write_text("x")
+        trash_id = dg._move_to_trash(p, "test", "quick-cleanup")
+        assert trash_id is not None
+
+        purged = dg.purge(older_than_days=30)
+        assert purged == 0
+        assert (dg.get_trash_dir() / trash_id).exists()
+
+    def test_list_trash_sorted_desc(self, _isolate_env):
+        dg = _load_lib()
+        ids = []
+        for name in ("a.txt", "b.txt"):
+            p = _isolate_env / name
+            p.write_text("x")
+            tid = dg._move_to_trash(p, "test", "quick-cleanup")
+            ids.append(tid)
+
+        entries = dg.list_trash()
+        assert len(entries) == 2
+        # Most recent first.
+        assert entries[0]["trash_id"] == ids[1]
+        assert entries[1]["trash_id"] == ids[0]
+
+    def test_quick_uses_quarantine(self, _isolate_env):
+        """quick() must move deletable files to trash, not hard-delete."""
+        dg = _load_lib()
+        p = _isolate_env / "test_quarantine.py"
+        p.write_text("x")
+        dg.track(str(p), "test", silent=True)
+
+        summary = dg.quick()
+        assert summary["deleted"] == 1
+        assert not p.exists()
+        # File must be in trash.
+        trash_entries = dg.list_trash()
+        assert any(e["original_path"] == str(p.resolve()) for e in trash_entries)
+
+    def test_deep_uses_quarantine(self, _isolate_env):
+        """deep() must move confirmed items to trash, not hard-delete."""
+        dg = _load_lib()
+        p = _isolate_env / "chrome_old.txt"
+        p.write_text("x")
+        # Track as chrome-profile with an old timestamp so deep() picks it up.
+        # chrome-profile has no 10-newest retention filter (unlike research).
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+        dg.track(str(p), "chrome-profile", silent=True)
+        tracked = dg.load_tracked()
+        for item in tracked:
+            if item["path"] == str(p.resolve()):
+                item["timestamp"] = old_ts
+        dg.save_tracked(tracked)
+
+        def confirm(item):
+            return True
+
+        result = dg.deep(confirm=confirm)
+        assert result["deep_deleted"] == 1
+        assert not p.exists()
+        trash_entries = dg.list_trash()
+        assert any(e["original_path"] == str(p.resolve()) for e in trash_entries)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 regression: disk-pressure trigger
+# ---------------------------------------------------------------------------
+
+class TestDiskPressure:
+    """Auto-cleanup at session end should only run when disk pressure is high
+    (or when test files were tracked).
+    """
+
+    def test_get_disk_usage_pct_returns_0_on_error(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        monkeypatch.setattr(os, "statvfs", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
+        assert dg.get_disk_usage_pct(_isolate_env) == 0
+
+    def test_get_disk_usage_pct_returns_int(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+
+        class FakeStat:
+            f_blocks = 1000
+            f_bfree = 200
+
+        monkeypatch.setattr(os, "statvfs", lambda *a, **kw: FakeStat())
+        pct = dg.get_disk_usage_pct(_isolate_env)
+        assert isinstance(pct, int)
+        assert pct == 80  # (1000-200)/1000 * 100
+
+    def test_should_auto_cleanup_true_when_above_threshold(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+
+        class FakeStat:
+            f_blocks = 1000
+            f_bfree = 100  # 90% used
+
+        monkeypatch.setattr(os, "statvfs", lambda *a, **kw: FakeStat())
+        # Default threshold is 85%.
+        assert dg.should_auto_cleanup(_isolate_env) is True
+
+    def test_should_auto_cleanup_false_when_below_threshold(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+
+        class FakeStat:
+            f_blocks = 1000
+            f_bfree = 300  # 70% used
+
+        monkeypatch.setattr(os, "statvfs", lambda *a, **kw: FakeStat())
+        assert dg.should_auto_cleanup(_isolate_env) is False
+
+    def test_on_session_end_skips_when_no_tests_and_low_disk(self, _isolate_env, monkeypatch):
+        pi = _load_plugin_init()
+        # Mock should_auto_cleanup on the module that __init__.py actually uses.
+        actual_dg = sys.modules["hermes_plugins.disk_cleanup.disk_cleanup"]
+        monkeypatch.setattr(actual_dg, "should_auto_cleanup", lambda *a, **kw: False)
+
+        # Nothing tracked, low disk → on_session_end should not call quick().
+        pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        # No tracked.json should have been created (quick() would have created it).
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists()
+
+    def test_on_session_end_runs_when_no_tests_but_high_disk(self, _isolate_env, monkeypatch):
+        pi = _load_plugin_init()
+        # Mock should_auto_cleanup on the module that __init__.py actually uses.
+        actual_dg = sys.modules["hermes_plugins.disk_cleanup.disk_cleanup"]
+        monkeypatch.setattr(actual_dg, "should_auto_cleanup", lambda *a, **kw: True)
+
+        # Nothing tracked, but high disk → on_session_end should call quick().
+        pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        # tracked.json is created by quick() even when empty.
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert tracked_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 regression: Matrix notification
+# ---------------------------------------------------------------------------
+
+class TestMatrixNotification:
+    """Cleanup summaries should be posted to Matrix when configured."""
+
+    def test_notify_skips_when_channel_not_matrix(self, _isolate_env, monkeypatch, caplog):
+        pi = _load_plugin_init()
+        actual_dg = sys.modules["hermes_plugins.disk_cleanup.disk_cleanup"]
+        monkeypatch.setattr(actual_dg, "get_notify_on_cleanup", lambda: "none")
+        monkeypatch.setattr(actual_dg, "quick", lambda: {
+            "deleted": 1, "empty_dirs": 0, "freed": 100, "errors": []
+        })
+
+        with caplog.at_level("INFO"):
+            pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        assert "disk-cleanup notification" not in caplog.text
+
+    def test_notify_logs_when_no_gateway(self, _isolate_env, monkeypatch, caplog):
+        pi = _load_plugin_init()
+        actual_dg = sys.modules["hermes_plugins.disk_cleanup.disk_cleanup"]
+        monkeypatch.setattr(actual_dg, "get_notify_on_cleanup", lambda: "matrix")
+        monkeypatch.setattr(actual_dg, "should_auto_cleanup", lambda *a, **kw: True)
+        monkeypatch.setattr(actual_dg, "quick", lambda: {
+            "deleted": 1, "empty_dirs": 0, "freed": 100, "errors": []
+        })
+
+        with caplog.at_level("INFO"):
+            pi._on_session_end(session_id="s1", completed=True, interrupted=False)
+        assert "disk-cleanup notification (matrix)" in caplog.text
+        assert "Cleaned 1 files" in caplog.text
+

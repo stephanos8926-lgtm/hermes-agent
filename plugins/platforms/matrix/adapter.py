@@ -536,12 +536,18 @@ class _MatrixModelPickerPrompt:
     chat_id: str
     message_id: str
     session_key: str
-    choices: dict[str, tuple[str, str]]
+    providers: list  # Full provider list for drill-down
+    current_provider: str
     on_model_selected: Any
     requester_user_id: str | None = None
     expires_at: float | None = None
     resolved: bool = False
     bot_reaction_events: dict[str, str] = field(default_factory=dict)
+    stage: str = "provider"  # "provider" or "model"
+    selected_provider: dict | None = None  # When stage == "model"
+    # Pagination for model stage
+    models: list = field(default_factory=list)  # Full model list for pagination
+    current_page: int = 0  # 0-indexed page for model stage
 
 
 @dataclass
@@ -2726,28 +2732,19 @@ class MatrixAdapter(BasePlatformAdapter):
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a Matrix reaction-based model picker."""
+        """Send a Matrix reaction-based model picker (two-step: provider → model)."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        flat_choices: list[tuple[str, str, str, str]] = []
-        for provider in providers or []:
-            provider_slug = str(provider.get("slug") or "")
-            provider_name = str(provider.get("name") or provider_slug)
-            models = provider.get("models") or []
-            for model_id in models:
-                if len(flat_choices) >= len(_MATRIX_MODEL_PICKER_REACTIONS):
-                    break
-                flat_choices.append((
-                    _MATRIX_MODEL_PICKER_REACTIONS[len(flat_choices)],
-                    str(model_id),
-                    provider_slug,
-                    provider_name,
-                ))
-            if len(flat_choices) >= len(_MATRIX_MODEL_PICKER_REACTIONS):
-                break
+        # Filter out providers with no models (except custom endpoints)
+        valid_providers = []
+        for p in providers or []:
+            models = p.get("models") or []
+            is_custom = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
+            if models or is_custom:
+                valid_providers.append(p)
 
-        if not flat_choices:
+        if not valid_providers:
             return await self.send(
                 chat_id,
                 "No authenticated models are available for this session.",
@@ -2760,17 +2757,24 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception:
             provider_label = current_provider
 
+        # Build provider selection screen
         lines = [
             "⚙ **Model Configuration**",
             f"Current model: `{current_model or 'unknown'}`",
             f"Provider: {provider_label or 'unknown'}",
             "",
-            "React to choose a model:",
+            "React to choose a **provider**:",
         ]
-        choices: dict[str, tuple[str, str]] = {}
-        for emoji, model_id, provider_slug, provider_name in flat_choices:
-            choices[emoji] = (model_id, provider_slug)
-            lines.append(f"{emoji} `{model_id}` — {provider_name}")
+        choices: dict[str, dict] = {}  # emoji -> provider dict
+        for i, provider in enumerate(valid_providers[:len(_MATRIX_MODEL_PICKER_REACTIONS)]):
+            emoji = _MATRIX_MODEL_PICKER_REACTIONS[i]
+            provider_slug = str(provider.get("slug") or "")
+            provider_name = str(provider.get("name") or provider_slug)
+            model_count = len(provider.get("models") or [])
+            total = provider.get("total_models", model_count)
+            extra = f" ({total} models)" if total > model_count else f" ({model_count} models)"
+            choices[emoji] = provider
+            lines.append(f"{emoji} **{provider_name}**`--provider {provider_slug}`{extra}")
 
         result = await self.send(chat_id, "\n".join(lines), metadata=metadata)
         if not result.success or not result.message_id:
@@ -2780,10 +2784,12 @@ class MatrixAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             message_id=result.message_id,
             session_key=session_key,
-            choices=choices,
+            providers=valid_providers,
+            current_provider=current_provider,
             on_model_selected=on_model_selected,
             requester_user_id=str((metadata or {}).get("requester_user_id") or "") or None,
             expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
+            stage="provider",
         )
         self._model_picker_prompts_by_event[result.message_id] = prompt
 
@@ -4088,6 +4094,59 @@ class MatrixAdapter(BasePlatformAdapter):
                     room_id, reacts_to, sender, model_prompt, "model picker"
                 ):
                     return
+
+                if model_prompt.stage == "provider":
+                    # Provider selected — show model list for that provider
+                    selected_provider = model_prompt.choices.get(key)
+                    if not selected_provider:
+                        await self._send_invalid_reaction_feedback(
+                            room_id,
+                            reacts_to,
+                            "That reaction is not one of the available provider choices.",
+                        )
+                        return
+
+                    models = selected_provider.get("models", [])
+                    if not models:
+                        # Custom endpoint with no pre-discovered models
+                        await self._send_invalid_reaction_feedback(
+                            room_id,
+                            reacts_to,
+                            f"Provider '{selected_provider.get('name', 'unknown')}' has no discoverable models. Use `/model <model_id>` directly.",
+                        )
+                        return
+
+                    # Update prompt to model selection stage
+                    model_prompt.stage = "model"
+                    model_prompt.selected_provider = selected_provider
+                    model_prompt.models = models  # Store full model list for pagination
+                    model_prompt.current_page = 0
+
+                    # Build paginated model keyboard
+                    await self._send_matrix_model_picker_page(room_id, model_prompt, reacts_to)
+
+                    return
+
+                # Stage == "model" — handle pagination or model selection
+                if key == "9\ufe0f\u20e3":  # Prev page (key 9)
+                    if model_prompt.current_page > 0:
+                        model_prompt.current_page -= 1
+                        await self._send_matrix_model_picker_page(room_id, model_prompt, reacts_to)
+                    else:
+                        # On page 0, just reload the same page (noop)
+                        await self._send_matrix_model_picker_page(room_id, model_prompt, reacts_to)
+                    return
+                elif key == "\U0001f51f":  # Next page (key 10)
+                    total_pages = (len(model_prompt.models) + 7) // 8  # 8 models per page
+                    if model_prompt.current_page < total_pages - 1:
+                        model_prompt.current_page += 1
+                        await self._send_matrix_model_picker_page(room_id, model_prompt, reacts_to)
+                    else:
+                        # On last page, just reload the same page (noop)
+                        await self._send_matrix_model_picker_page(room_id, model_prompt, reacts_to)
+                    return
+
+                # Model selected
                 selection = model_prompt.choices.get(key)
                 if not selection:
                     await self._send_invalid_reaction_feedback(
@@ -4236,6 +4295,75 @@ class MatrixAdapter(BasePlatformAdapter):
             target_event_id,
             "This model picker has expired. Run `/model` again to choose a model.",
         )
+
+    async def _send_matrix_model_picker_page(
+        self,
+        room_id: str,
+        prompt: "_MatrixModelPickerPrompt",
+        reply_to: str | None = None,
+    ) -> None:
+        """Send or update a paginated model picker page."""
+        provider = prompt.selected_provider
+        models = prompt.models
+        page = prompt.current_page
+        models_per_page = 8
+
+        total_pages = (len(models) + models_per_page - 1) // models_per_page
+        start_idx = page * models_per_page
+        end_idx = min(start_idx + models_per_page, len(models))
+        page_models = models[start_idx:end_idx]
+
+        # Build keyboard
+        lines = [
+            "⚙ **Model Configuration**",
+            f"Provider: **{provider.get('name', 'unknown')}**",
+            f"Page {page + 1}/{total_pages} — React to choose a **model**:",
+        ]
+        model_choices: dict[str, tuple[str, str]] = {}
+
+        # Add model reactions (1-8)
+        for i, model_id in enumerate(page_models):
+            emoji = _MATRIX_MODEL_PICKER_REACTIONS[i]
+            model_choices[emoji] = (model_id, provider.get("slug", ""))
+            lines.append(f"{emoji} `{model_id}`")
+
+        # Add pagination controls if more than one page
+        if total_pages > 1:
+            lines.append("")
+            # Key 9 = prev page (🔚), Key 10 = next page (🔛)
+            lines.append(f"9️⃣ Previous page {'(disabled)' if page == 0 else ''}")
+            lines.append(f"🔛 Next page {'(disabled)' if page >= total_pages - 1 else ''}")
+
+        await self._redact_bot_model_picker_reactions(room_id, prompt)
+
+        result = await self.send(room_id, "\n".join(lines), reply_to=reply_to)
+        if not result.success or not result.message_id:
+            return
+
+        # Update the prompt's message_id and choices
+        prompt.message_id = result.message_id
+        prompt.choices = model_choices
+        self._model_picker_prompts_by_event[result.message_id] = prompt
+        self._model_picker_prompts_by_event.pop(reply_to, None) if reply_to else None
+
+        # Add reactions for model choices (1-8)
+        for emoji in model_choices:
+            try:
+                reaction_event_id = await self._send_reaction(room_id, result.message_id, emoji)
+                if reaction_event_id:
+                    prompt.bot_reaction_events[emoji] = str(reaction_event_id)
+            except Exception as exc:
+                logger.debug("Matrix: failed to add model picker reaction %s: %s", emoji, exc)
+
+        # Add pagination reactions (9 and 10) if needed
+        if total_pages > 1:
+            for emoji in ["9\ufe0f\u20e3", "\U0001f51f"]:
+                try:
+                    reaction_event_id = await self._send_reaction(room_id, result.message_id, emoji)
+                    if reaction_event_id:
+                        prompt.bot_reaction_events[emoji] = str(reaction_event_id)
+                except Exception as exc:
+                    logger.debug("Matrix: failed to add pagination reaction %s: %s", emoji, exc)
 
     async def _redact_bot_approval_reactions(
         self,
