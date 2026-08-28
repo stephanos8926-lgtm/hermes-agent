@@ -51,6 +51,7 @@ from tools.tool_result_storage import (
     extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from hermes_cli.replay_economy import cache_check, cache_store
 
 logger = logging.getLogger(__name__)
 
@@ -1338,6 +1339,36 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         try:
             try:
+                # D-1: Replay Economy cache check — before tool execution
+                session_id = agent.session_id or ""
+                cached_result = cache_check(function_name, function_args, session_id)
+                if cached_result is not None:
+                    # Cache hit — use cached result, skip tool execution
+                    function_result = cached_result.get("content", "")
+                    # Emit post-tool-call event for the cached result
+                    _emit_terminal_post_tool_call(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=function_result,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        duration_ms=0,
+                        middleware_trace=list(middleware_trace),
+                    )
+                    # Return cached result
+                    duration = time.time() - start
+                    results[index] = (
+                        function_name,
+                        function_args,
+                        function_result,
+                        duration,
+                        False,  # not error
+                        False,  # not blocked
+                        middleware_trace,
+                    )
+                    return
+
                 def _execute(next_args: dict[str, Any]) -> Any:
                     return agent._invoke_tool(
                         function_name,
@@ -1779,6 +1810,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        # D-1: Replay Economy cache store — after tool execution (on miss path)
+        session_id = agent.session_id or ""
+        cache_store(name, args, {
+            "role": "tool",
+            "tool_call_id": getattr(tc, "id", "") or "",
+            "content": function_result,
+        }, session_id)
+
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -2038,6 +2077,43 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        # D-1: Replay Economy cache check — before tool execution
+        session_id = agent.session_id or ""
+        cached_result = cache_check(function_name, function_args, session_id)
+        if cached_result is not None:
+            # Cache hit — use cached result, skip tool execution
+            function_result = cached_result.get("content", "")
+            # Emit post-tool-call event for the cached result
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=0,
+                middleware_trace=[],
+            )
+            # Append to messages
+            _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
+            tool_message = make_tool_result_message(
+                function_name,
+                _tool_content,
+                tool_call.id,
+                effect_disposition="cached",
+            )
+            messages.append(tool_message)
+            if not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage=f"cached tool result {function_name}",
+            ):
+                return
+            # Skip to next tool call
+            agent._current_tool = None
+            agent._touch_activity(f"tool cached: {function_name}")
+            continue
 
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
@@ -2699,6 +2775,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
+
+        # D-1: Replay Economy cache store — after tool execution (on miss path)
+        session_id = agent.session_id or ""
+        cache_store(function_name, function_args, {
+            "role": "tool",
+            "tool_call_id": getattr(tool_call, "id", "") or "",
+            "content": function_result,
+        }, session_id)
 
         display_function_result = function_result
         function_result = maybe_persist_tool_result(

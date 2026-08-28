@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 #: Schema version. Bump MAJOR on breaking field changes, MINOR on additions.
-SNAPSHOT_SCHEMA_VERSION = "1.0"
+SNAPSHOT_SCHEMA_VERSION = "1.1"
 
 #: Project root is consulted only for the disk check; default is the
 #: current working directory if the import that sets it is unavailable.
@@ -147,6 +147,32 @@ def _uptime_seconds(start_time: float | None) -> int | None:
         return None
 
 
+def _read_replay_economy_counters(hermes_home: Path) -> dict[str, Any] | None:
+    """Read replay economy counters from the persisted file.
+    
+    Returns None if file doesn't exist or is stale (> 5 min old).
+    """
+    counters_path = hermes_home / "data" / "replay_economy_counters.json"
+    if not counters_path.exists():
+        return None
+    try:
+        data = json.loads(counters_path.read_text(encoding="utf-8"))
+        # Check staleness
+        updated_at = data.get("updated_at")
+        if updated_at:
+            from datetime import datetime, timezone
+            try:
+                updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+                if age > 300:  # 5 minutes
+                    return None
+            except Exception:
+                pass
+        return data
+    except Exception:
+        return None
+
+
 def collect_snapshot(
     *,
     gateway_pids: tuple[int, ...] = (),
@@ -211,22 +237,71 @@ def collect_snapshot(
         if _state_uptime is not None:
             runtime["uptime_seconds"] = _state_uptime
 
-    # ── cache block (placeholder until gateway exposes counters) ────────
-    # v1: shape the consumer will read, values null. v2 will fill these
-    # from real gateway counters once they're instrumented.
-    cache: dict[str, Any] = {
-        "l1": {"hits": None, "misses": None, "hit_rate_pct": None},
-        "l2": {"hits": None, "misses": None, "hit_rate_pct": None},
-        "agent_cache": {
-            "enabled": None,
-            "max_bytes": None,
-            "current_bytes": None,
-        },
-        "_note": (
-            "Cache counters are not yet exposed by the gateway. "
-            "Fields are null in v1; will be wired in a v2 schema bump."
-        ),
-    }
+    # ── cache block (v1.1: includes replay economy counters) ────────────────
+    # v1: shape the consumer will read, values null. v1.1 adds replay
+    # economy fields (request_cache, wire_compaction) that are populated
+    # when the replay economy module is active. Fields remain null when
+    # the feature is disabled or not yet initialized.
+    replay_counters = _read_replay_economy_counters(hermes_home)
+    
+    if replay_counters:
+        # Replay economy is active — populate from persisted counters
+        l1 = replay_counters.get("replay_l1", {})
+        wire = replay_counters.get("replay_wire", {})
+        cache: dict[str, Any] = {
+            "l1": {"hits": None, "misses": None, "hit_rate_pct": None},
+            "l2": {"hits": None, "misses": None, "hit_rate_pct": None},
+            "agent_cache": {
+                "enabled": None,
+                "max_bytes": None,
+                "current_bytes": None,
+            },
+            "request_cache": {
+                "hits": l1.get("hits"),
+                "misses": l1.get("misses"),
+                "hit_rate_pct": l1.get("hit_rate_pct"),
+                "entries": None,  # Not tracked in current implementation
+                "max_entries": None,
+            },
+            "wire_compaction": {
+                "externalized_count": wire.get("compactions"),
+                "bytes_saved": wire.get("bytes_saved_total"),
+                "avg_compression_ratio": wire.get("compression_ratio_pct"),
+            },
+            "_note": (
+                "Cache counters are not yet exposed by the gateway. "
+                "Fields are null in v1; will be wired in a v2 schema bump. "
+                "v1.1 adds replay economy fields (request_cache, wire_compaction)."
+            ),
+        }
+    else:
+        # Replay economy not active — v1 shape with nulls
+        cache: dict[str, Any] = {
+            "l1": {"hits": None, "misses": None, "hit_rate_pct": None},
+            "l2": {"hits": None, "misses": None, "hit_rate_pct": None},
+            "agent_cache": {
+                "enabled": None,
+                "max_bytes": None,
+                "current_bytes": None,
+            },
+            "request_cache": {
+                "hits": None,
+                "misses": None,
+                "hit_rate_pct": None,
+                "entries": None,
+                "max_entries": None,
+            },
+            "wire_compaction": {
+                "externalized_count": None,
+                "bytes_saved": None,
+                "avg_compression_ratio": None,
+            },
+            "_note": (
+                "Cache counters are not yet exposed by the gateway. "
+                "Fields are null in v1; will be wired in a v2 schema bump. "
+                "v1.1 adds replay economy fields (request_cache, wire_compaction)."
+            ),
+        }
 
     # ── disk block ───────────────────────────────────────────────────────
     free, total, used_pct, disk_err = _disk_snapshot(hermes_home)
