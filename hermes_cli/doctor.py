@@ -792,6 +792,96 @@ def _check_s6_supervision(issues: list[str]) -> None:
     )
 
 
+_DISK_WARN_FREE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB free-space floor
+
+
+def _check_disk_headroom(issues: list[str]) -> None:
+    """Report free disk space on the Hermes home and project root.
+
+    A full disk fails silently: session writes, cron jobs, and the
+    gateway's state.db all degrade without a clear error. Surface free
+    space (and warn below a conservative floor) so a nearly-full disk is
+    visible before it breaks something.
+    """
+    _section("Disk Space")
+    targets: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for label, path in (
+        ("Hermes home", HERMES_HOME),
+        ("Project root", PROJECT_ROOT),
+    ):
+        try:
+            resolved = str(Path(path).resolve())
+        except OSError:
+            resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        targets.append((label, Path(path)))
+
+    for label, path in targets:
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            check_info(f"{label}: disk usage unavailable ({exc})")
+            continue
+        free = usage.free
+        total = usage.total
+        pct_free = (free / total * 100) if total else 0.0
+        if free < _DISK_WARN_FREE_BYTES:
+            check_warn(
+                f"{label}: low disk space",
+                f"({_human_bytes(free)} free of {_human_bytes(total)})",
+            )
+            issues.append(
+                f"Low disk space on {label} ({_human_bytes(free)} free) — "
+                "free up space or run 'hermes sessions optimize-storage' "
+                "(gateway stopped) to compact state.db"
+            )
+        else:
+            check_ok(
+                f"{label}: {_human_bytes(free)} free",
+                f"({pct_free:.0f}% of {_human_bytes(total)})",
+            )
+
+
+def _check_gateway_process() -> None:
+    """Report the running gateway's PID and resident memory (read-only).
+
+    Uses psutil (core dependency) to read RSS; degrades to an info line
+    when psutil is unavailable or no gateway is running. This is the
+    doctor-side counterpart to the gateway's own mem_trim telemetry.
+    """
+    _section("Gateway Process")
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        pids = list(find_gateway_pids())
+    except Exception:
+        pids = []
+    if not pids:
+        check_info("No gateway process running")
+        return
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        check_info(
+            f"Gateway running (PID {', '.join(map(str, pids))}); "
+            "RSS unavailable (psutil missing)"
+        )
+        return
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            rss = proc.memory_info().rss
+            check_ok(f"Gateway PID {pid}", f"(RSS {_human_bytes(rss)})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            check_info(
+                f"Gateway PID {pid}: RSS unavailable "
+                "(process gone or access denied)"
+            )
+
+
 def check_certificates(should_fix: bool = False, issues: "list | None" = None) -> None:
     """Verify the certifi CA bundle is loadable.
 
@@ -1993,6 +2083,8 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+    _check_disk_headroom(issues)
+    _check_gateway_process()
 
     if sys.platform != "win32":
         _section("Command Installation")

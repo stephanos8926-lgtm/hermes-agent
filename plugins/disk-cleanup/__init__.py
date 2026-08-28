@@ -158,7 +158,12 @@ def _on_session_end(
     interrupted: bool = False,
     **_: Any,
 ) -> None:
-    """Run quick cleanup if any test files were tracked during this turn."""
+    """Run quick cleanup if any test files were tracked during this turn.
+
+    Also runs the v3.1.0 housekeeping jobs at session end:
+    log retention, backup rotation, and (opt-in) DB vacuum. Each is
+    feature-gated and never raises.
+    """
     # Drain both task-level and session-level buckets.  In practice only one
     # is populated per turn; the other is empty.
     drained_session = _drain("", session_id)
@@ -172,20 +177,52 @@ def _on_session_end(
         if key and key != session_id:
             _recent_test_tracks.pop(key, None)
 
-    if not drained_session and not task_buckets:
-        return
+    # ---- Core ephemeral-file cleanup (gated on activity) ----
+    ran_quick = False
+    if drained_session or task_buckets:
+        try:
+            summary = dg.quick()
+        except Exception as exc:
+            logger.debug("disk-cleanup quick cleanup failed: %s", exc)
+            summary = None
+        if summary and (summary["deleted"] or summary["empty_dirs"]):
+            dg._log(
+                f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
+                f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
+            )
+            ran_quick = True
 
+    # ---- v3.1.0: log retention ----
     try:
-        summary = dg.quick()
+        log_report = dg.prune_old_logs()
+        if len(log_report.get("deleted", [])) > 0:
+            dg._log(
+                f"AUTO_LOG_RETENTION (session_end): "
+                f"deleted={len(log_report['deleted'])} retention_days={log_report.get('retention_days')}"
+            )
     except Exception as exc:
-        logger.debug("disk-cleanup quick cleanup failed: %s", exc)
-        return
+        logger.debug("disk-cleanup log retention failed: %s", exc)
 
-    if summary["deleted"] or summary["empty_dirs"]:
-        dg._log(
-            f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
-            f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
-        )
+    # ---- v3.1.0: backup rotation ----
+    try:
+        backup_report = dg.rotate_disk_cleanup_backups()
+        if backup_report.get("deleted_count", 0) > 0:
+            dg._log(
+                f"AUTO_BACKUP_ROTATION (session_end): "
+                f"deleted={backup_report['deleted_count']}"
+            )
+    except Exception as exc:
+        logger.debug("disk-cleanup backup rotation failed: %s", exc)
+
+    # ---- v3.1.0: opt-in DB vacuum (gated by disk_cleanup.db_vacuum_enabled) ----
+    try:
+        vacuum_report = dg.auto_vacuum_dbs()
+        if vacuum_report.get("ok"):
+            dg._log(
+                f"AUTO_VACUUM (session_end): state.db + lcm.db vacuumed"
+            )
+    except Exception as exc:
+        logger.debug("disk-cleanup auto vacuum failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +239,19 @@ Subcommands:
   deep                       Run quick, then list items that need prompts
   track <path> <category>    Manually add a path to tracking
   forget <path>              Stop tracking a path (does not delete)
+  prune-logs [days]          Prune rotated log files older than N days
+                             (default from disk_cleanup.log_retention_days)
+  rotate-backups [days]      Prune tracked.json.bak files older than N days
+                             (default from disk_cleanup.backup_retention_days)
+  vacuum-dbs                 Opt-in: run hermes db vacuum on state.db + lcm.db
+                             (gated by disk_cleanup.db_vacuum_enabled)
 
 Categories: temp | test | research | download | chrome-profile | cron-output | other
 
 All operations are scoped to HERMES_HOME and /tmp/hermes-*.
 Test files are auto-tracked on write_file / terminal and auto-cleaned at session end.
+Log retention, backup rotation, and DB vacuum also run automatically at session end
+when their respective feature gates are enabled.
 """
 
 
@@ -298,6 +343,36 @@ def _handle_slash(raw_args: str) -> Optional[str]:
             f"Removed {n} tracking entr{'y' if n == 1 else 'ies'} for {argv[1]}."
             if n else f"Not found in tracking: {argv[1]}"
         )
+
+    if sub == "prune-logs":
+        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else None
+        report = dg.prune_old_logs(days=days)
+        if report.get("skipped"):
+            return f"[disk-cleanup] log retention: skipped ({report.get('reason')})"
+        deleted_count = len(report.get("deleted", []))
+        return (
+            f"[disk-cleanup] log retention: deleted {deleted_count} files "
+            f"(kept {report.get('kept', 0)}, retention_days={report.get('retention_days')})"
+        )
+
+    if sub == "rotate-backups":
+        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else None
+        report = dg.rotate_disk_cleanup_backups(days=days)
+        if report.get("skipped"):
+            return f"[disk-cleanup] backup rotation: skipped ({report.get('reason')})"
+        return (
+            f"[disk-cleanup] backup rotation: scanned {report['scanned']}, "
+            f"deleted {report['deleted_count']} files (retention_days={report['retention_days']})"
+        )
+
+    if sub == "vacuum-dbs":
+        report = dg.auto_vacuum_dbs()
+        if report.get("skipped"):
+            return f"[disk-cleanup] db vacuum: skipped ({report.get('reason')})"
+        if report.get("ok"):
+            targets = ", ".join(report.get("results", {}).keys())
+            return f"[disk-cleanup] db vacuum: {targets} vacuumed"
+        return f"[disk-cleanup] db vacuum: {report}"
 
     return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
 

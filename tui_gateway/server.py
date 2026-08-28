@@ -16,7 +16,8 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -3683,9 +3684,19 @@ def _load_cfg_raw() -> dict:
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
+                # Shallow copy of the cache: gives the caller its own top-level
+                # dict for write-back primitives like cfg.pop() and
+                # cfg["display"] = {...} (callers that mutate, and there are
+                # many). The inner values are read-only views
+                # (``MappingProxyType``); callers' `isinstance(x, dict)` guards
+                # already fall through to a fresh ``{}`` and overwrite the
+                # proxy, so the read-only contract is naturally honored.
+                # This is O(top-level keys) vs the previous ``copy.deepcopy``
+                # which was O(total config size) on every read.
+                return _shallow_cfg_copy(_cfg_cache)
         if p.exists():
             from hermes_cli.config import read_user_config_raw
+
             data = read_user_config_raw(p)
         else:
             data = {}
@@ -3693,15 +3704,16 @@ def _load_cfg_raw() -> dict:
             # Cache the RAW user config (no managed overlay) so _save_cfg, which
             # writes _cfg_cache back to disk, never persists managed values into
             # the user's file. The managed overlay is applied on every return
-            # path instead (read-side only).
-            _cfg_cache = copy.deepcopy(data)
+            # path instead (read-side only). Wrap in a read-only view so
+            # caller mutations on the cache hit path are surface as TypeError
+            # rather than silently corrupting the cache.
+            _cfg_cache = _read_only_view(data) if isinstance(data, dict) else data
             _cfg_mtime = mtime
             _cfg_path = p
-        return data
+        return _shallow_cfg_copy(_cfg_cache)
     except Exception:
         pass
     return {}
-
 
 def _load_cfg() -> dict:
     """Behavioral config read: raw user file + managed overlay + ${VAR} expansion.
@@ -3744,6 +3756,66 @@ def _apply_managed(cfg: dict) -> dict:
         return cfg
 
 
+def _read_only_view(data: Any) -> Any:
+    """Recursively wrap a parsed-config tree in ``MappingProxyType`` views.
+
+    The TUI cache stored the raw user config (mutable dict) and returned a
+    ``copy.deepcopy(...)`` of it on every read to prevent caller mutation
+    from poisoning the cache. The deepcopy is O(n) over the full config
+    size on every call. Wrapping in read-only proxies is O(1) and surfaces
+    accidental mutations as ``TypeError`` rather than a silent cache
+    corruption, which is the correct contract for a cache.
+
+    Lists are returned as tuples so the view is fully immutable (callers
+    can't append / pop). Strings, ints, and other scalars are returned
+    as-is — they're already immutable.
+    """
+    if isinstance(data, dict):
+        return MappingProxyType({k: _read_only_view(v) for k, v in data.items()})
+    if isinstance(data, list):
+        return tuple(_read_only_view(item) for item in data)
+    return data
+
+
+def _shallow_cfg_copy(cached: Mapping | None) -> dict:
+    """Return a fresh top-level dict from a cached read-only view.
+
+    The cache stores a ``MappingProxyType`` view (from ``_read_only_view``).
+    Callers that need to mutate the top-level config (the write-back
+    primitives like ``cfg.pop(...)`` and ``cfg["display"] = ...``) need a
+    fresh mutable dict at the top level. The inner values remain read-only
+    views, but the write-back call sites always assign fresh dicts (their
+    ``isinstance(x, dict)`` guards fall through to ``{}`` for non-dict
+    inputs, then assign back), so the read-only contract holds.
+
+    This is O(top-level keys) vs the prior ``copy.deepcopy(_cfg_cache)``
+    which was O(total config size) on every read.
+    """
+    if cached is None:
+        return {}
+    if isinstance(cached, Mapping):
+        return {k: v for k, v in cached.items()}
+    return {}
+
+
+def _cfg_copy_for_writeback(data: Mapping | None) -> dict:
+    """Convert a read-only view back to a mutable dict for the write-back path.
+
+    The TUI's ``_load_cfg_raw`` returns a top-level dict copy with inner
+    ``MappingProxyType`` views; callers that need a fully mutable copy
+    (e.g. ``_save_cfg``'s serializer) need this helper. It's also the
+    single chokepoint for the "raw cache = immutable, write = mutable
+    copy" rule.
+    """
+    if data is None:
+        return {}
+    if isinstance(data, Mapping):
+        return {k: _cfg_copy_for_writeback(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_cfg_copy_for_writeback(item) for item in data]
+    return data
+
+
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
 
@@ -3758,9 +3830,15 @@ def _save_cfg(cfg: dict):
     # mangled to \\uXXXX escapes). Fails closed on an unreadable existing
     # config.yaml the same way atomic_config_write does (see
     # atomic_roundtrip_yaml_save's require_readable_config_before_write call).
+    # Materialise any MappingProxyType views back to a mutable dict for
+    # atomic_roundtrip_yaml_save, which expects to be able to walk and
+    # serialise the input.
+    cfg = _cfg_copy_for_writeback(cfg)
     atomic_roundtrip_yaml_save(path, cfg)
     with _cfg_lock:
-        _cfg_cache = copy.deepcopy(cfg)
+        # The cache holds a read-only view; re-wrap the just-saved mutable
+        # copy so the next cache hit returns the same immutable contract.
+        _cfg_cache = _read_only_view(cfg) if isinstance(cfg, dict) else cfg
         _cfg_path = path
         try:
             _cfg_mtime = path.stat().st_mtime

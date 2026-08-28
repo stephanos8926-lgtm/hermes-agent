@@ -5410,6 +5410,32 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    # Round 2 R3 — bridge the matrix: block's connection params (homeserver,
+    # user_id, password, device_id, encryption flags) into MATRIX_* env vars.
+    # The original _apply_yaml_config only bridged the gating fields
+    # (require_mention, allowed_users, ...), which left the connection
+    # fields at env-var-only. That was fine for users who set MATRIX_HOMESERVER
+    # in .env, but a user who configures matrix purely via config.yaml would
+    # see "homeserver URL not configured" because the env-var bridge in
+    # gateway/config.py requires MATRIX_HOMESERVER to be set in the env.
+    # Adding these bridges closes the loop: any field set under matrix: in
+    # config.yaml reaches the adapter via env, the same way the gating
+    # fields already do. Env vars still take precedence.
+    homeserver = matrix_cfg.get("homeserver")
+    if homeserver is not None and not os.getenv("MATRIX_HOMESERVER"):
+        os.environ["MATRIX_HOMESERVER"] = str(homeserver).rstrip("/")
+    matrix_user_id = matrix_cfg.get("user_id")
+    if matrix_user_id is not None and not os.getenv("MATRIX_USER_ID"):
+        os.environ["MATRIX_USER_ID"] = str(matrix_user_id)
+    matrix_password = matrix_cfg.get("password")
+    if matrix_password is not None and not os.getenv("MATRIX_PASSWORD"):
+        os.environ["MATRIX_PASSWORD"] = str(matrix_password)
+    matrix_device_id = matrix_cfg.get("device_id")
+    if matrix_device_id is not None and not os.getenv("MATRIX_DEVICE_ID"):
+        os.environ["MATRIX_DEVICE_ID"] = str(matrix_device_id)
+    matrix_e2ee_mode = matrix_cfg.get("e2ee_mode")
+    if matrix_e2ee_mode is not None and not os.getenv("MATRIX_E2EE_MODE"):
+        os.environ["MATRIX_E2EE_MODE"] = str(matrix_e2ee_mode).strip().lower()
     return None
 
 

@@ -3143,6 +3143,18 @@ class ContextCompressor(ContextEngine):
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "legacy"
+        # Custom compaction prompt override (compression.prompt / CONTEXT_COMPRESSION_PROMPT).
+        # When set (non-empty after strip), it REPLACES the default summarizer
+        # preamble in the batch + micro compaction prompts. The structural
+        # template, token target, temporal-anchoring, and security rules are
+        # always re-appended on top of whatever the custom preamble says, so an
+        # override can steer the summarizer's tone/emphasis but cannot disable
+        # the [REDACTED] credential rule or the stable output structure.
+        self.compaction_prompt = (
+            compaction_prompt_override.strip()
+            if compaction_prompt_override and compaction_prompt_override.strip()
+            else None
+        )
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.

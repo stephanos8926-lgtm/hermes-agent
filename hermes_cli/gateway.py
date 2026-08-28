@@ -8320,6 +8320,23 @@ def _gateway_command_inner(args):
             run_gateway(verbose=0)
 
     elif subcmd == "status":
+        # --json short-circuits everything below. Emit a versioned
+        # snapshot suitable for `jq` and agent consumers; the human
+        # status path (systemd/launchd/Windows fallbacks, profile
+        # listing) is skipped to keep the output machine-parseable.
+        if getattr(args, "json_snapshot", False):
+            # --json short-circuits everything below. We compute the
+            # gateway pids directly (the `snapshot` local isn't assigned
+            # until the non-json branch below) and pass them into
+            # collect_snapshot(), which reads the rest from
+            # gateway_state.json + psutil + disk_usage.
+            from hermes_cli.gateway_snapshot import collect_snapshot, render_json
+
+            pids = tuple(find_gateway_pids())
+            data = collect_snapshot(gateway_pids=pids)
+            print(render_json(data))
+            return
+
         deep = getattr(args, "deep", False)
         full = getattr(args, "full", False)
         system = getattr(args, "system", False)

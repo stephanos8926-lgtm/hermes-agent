@@ -473,6 +473,7 @@ from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.db import build_db_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
@@ -11835,6 +11836,27 @@ def cmd_logs(args):
         list_logs()
         return
 
+    if log_name == "prune":
+        from hermes_logging import prune_old_logs
+        from hermes_constants import get_hermes_home
+
+        override_days = getattr(args, "days", None)
+        result = prune_old_logs(
+            get_hermes_home() / "logs",
+            retention_days=override_days,
+        )
+        print(
+            f"prune: scanned {result['scanned']} file(s), "
+            f"deleted {len(result['deleted'])}, "
+            f"kept {len(result['kept'])}, "
+            f"retention {result['retention_days']} day(s)"
+        )
+        if result["errors"]:
+            print(f"  {len(result['errors'])} error(s) during sweep:")
+            for path, err in result["errors"][:10]:
+                print(f"    {path}: {err}")
+        return
+
     tail_log(
         log_name,
         num_lines=getattr(args, "lines", 50),
@@ -11843,6 +11865,34 @@ def cmd_logs(args):
         session=getattr(args, "session", None),
         since=getattr(args, "since", None),
         component=getattr(args, "component", None),
+    )
+
+
+def cmd_db(args):
+    """Inspect and maintain Hermes sqlite databases.
+
+    Thin wrapper over hermes_state.repair_state_db_schema,
+    hermes_state.quarantine_zeroed_state_db, and
+    hermes_state.collect_state_db_stats. The LCM store is checked
+    separately because it has its own schema and lives in a
+    different directory.
+
+    Why this lives at the top level (and not under 'sessions' or
+    a plugin): the maintenance primitives already exist in
+    hermes_state.py and are not session-scoped. Per AGENTS.md
+    footprint ladder, a new CLI command + skill is the right
+    surface — no core-tool registration needed.
+    """
+    from pathlib import Path
+
+    from hermes_cli.subcommands.db_handler import run_db_action
+
+    return run_db_action(
+        action=getattr(args, "action", "check"),
+        target=getattr(args, "target", "state.db") or "state.db",
+        include_lcm=bool(getattr(args, "lcm", False)),
+        skip_backup=bool(getattr(args, "no_backup", False)),
+        hermes_home=Path(get_hermes_home()),
     )
 
 
@@ -11882,7 +11932,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "config", "console", "cron", "curator", "dashboard", "serve", "db", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
@@ -14115,6 +14165,11 @@ def main():
     # logs command  (parser built in hermes_cli/subcommands/logs.py)
     # =========================================================================
     build_logs_parser(subparsers, cmd_logs=cmd_logs)
+
+    # =========================================================================
+    # db command  (parser built in hermes_cli/subcommands/db.py)
+    # =========================================================================
+    build_db_parser(subparsers, cmd_db=cmd_db)
 
     # =========================================================================
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)

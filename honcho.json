@@ -1,0 +1,44 @@
+{
+  "hosts": {
+    "hermes": {
+      "peerName": "sysop",
+      "aiPeer": "hermes",
+      "workspace": "hermes",
+      "observationMode": "directional",
+      "writeFrequency": "async",
+      "recallMode": "hybrid",
+      "dialecticCadence": 3,
+      "dialecticDepth": 2,
+      "dialecticDepthLevels": ["minimal", "medium"],
+      "dialecticReasoningLevel": "medium",
+      "dialecticDynamic": true,
+      "dialecticMaxChars": 600,
+      "contextCadence": 2,
+      "contextTokens": 2500,
+      "injectionFrequency": "every-turn",
+      "sessionStrategy": "per-repo",
+      "sessionAiPeerPrefix": true,
+      "sessionPeerPrefix": true,
+      "messageMaxChars": 25000,
+      "dialecticMaxInputChars": 10000,
+      "reasoningHeuristic": true,
+      "reasoningLevelCap": "high",
+      "firstTurnBaseWait": 3.0,
+      "firstTurnDialecticWait": 2.0,
+      "queryRewrite": false,
+      "saveMessages": true,
+      "pinUserPeer": false,
+      "sessionPeerPrefix": true,
+      "enabled": true,
+      "apiKey": "local",
+      "environment": "local",
+      "sessions": {
+        "/home/sysop/Workspaces/hermes-agent": "hermes-agent-main",
+        "/home/sysop/Workspaces/ast-tools": "ast-tools-main",
+        "/home/sysop/Workspaces/NexusAgent": "NexusAgent-main",
+        "/home/sysop/Workspaces/rw_exfil": "rw_exfil-main"
+      }
+    }
+  },
+  "baseUrl": "http://100.64.255.48:8000"
+}

@@ -3649,6 +3649,11 @@ def _gateway_config_home() -> Path:
     return _hermes_home
 
 
+# C5: memo for non-canonical gateway config reads (test fixtures,
+# multiplexed profile routes). Keyed on (path, mtime_ns, size); bounded.
+_NONCANONICAL_CFG_CACHE: "dict[tuple, dict]" = {}
+
+
 def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     """Load and parse a gateway config.yaml, returning {} on any error.
 
@@ -3679,11 +3684,26 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
         pass
 
     if not used_canonical:
+        # C5: non-canonical paths (test fixtures, multiplexed profiles)
+        # previously re-ran yaml.safe_load on EVERY gateway RPC. Memoize
+        # keyed on (path, mtime_ns, size) -- any file change produces a
+        # new key, so staleness is impossible. Mirrors the mtime-cache
+        # contract of hermes_cli.config.read_raw_config: callers must
+        # not mutate the returned dict (same rule as the canonical path).
         try:
-            if config_path.exists():
+            st = config_path.stat()
+            cache_key = (str(config_path), st.st_mtime_ns, st.st_size)
+            cached = _NONCANONICAL_CFG_CACHE.get(cache_key)
+            if cached is not None:
+                raw = cached
+            elif config_path.exists():
                 import yaml
                 with open(config_path, 'r', encoding='utf-8') as f:
                     raw = yaml.safe_load(f) or {}
+                _NONCANONICAL_CFG_CACHE[cache_key] = raw
+                # Bound the memo: distinct fixture/profile paths only.
+                while len(_NONCANONICAL_CFG_CACHE) > 8:
+                    _NONCANONICAL_CFG_CACHE.pop(next(iter(_NONCANONICAL_CFG_CACHE)))
         except Exception:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
@@ -6724,6 +6744,30 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+
+
+
+def _agent_cache_entry_byte_estimate(entry) -> int:
+    """Rough byte weight of a cached agent-cache entry (C4).
+
+    The dominant memory consumer is the live transcript list; system
+    prompt and config are shared/references. Uses a per-message floor
+    plus a repr-based sample of recent messages -- deliberately cheap
+    (no full serialization) since it runs under the cache lock on
+    every enforcement pass.
+    """
+    try:
+        agent = entry[0] if isinstance(entry, tuple) and entry else entry
+        if agent is None or not hasattr(agent, "_session_messages"):
+            return 4096  # garbage entry: conservative default
+        msgs = getattr(agent, "_session_messages", None) or []
+        base = len(msgs) * 2048  # ~2 KiB/message floor
+        sample = msgs[-5:] if len(msgs) > 5 else msgs
+        sampled = sum(len(repr(m)) for m in sample)
+        per_msg = (sampled / len(sample)) if sample else 0
+        return int(base + per_msg * min(len(msgs), 200))
+    except Exception:
+        return 4096  # conservative default
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -27610,6 +27654,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for key, _ in evict_plan:
             _cache.pop(key, None)
+
+        # C4 second valve: aggregate byte budget for cached transcripts.
+        # Flag-gated (bounds.max_bytes unset => disabled, prior behavior).
+        # Count caps alone cannot bound memory when transcripts grow
+        # unboundedly within max_size -- this is the structural fix for
+        # the 250-440 MiB RSS climb observed in gateway exit heartbeats.
+        try:
+            _c4_bounds = self._agent_cache_bounds()
+        except Exception:
+            logger.debug("C4 valve: bounds resolution failed", exc_info=True)
+            _c4_bounds = None
+        max_bytes = getattr(_c4_bounds, "max_bytes", None) if _c4_bounds else None
+        if max_bytes is not None:
+            total_bytes = sum(
+                _agent_cache_entry_byte_estimate(entry)
+                for entry in _cache.values()
+            )
+            if total_bytes > max_bytes:
+                for key in list(_cache.keys()):
+                    if total_bytes <= max_bytes:
+                        break
+                    entry = _cache.get(key)
+                    agent = (
+                        entry[0]
+                        if isinstance(entry, tuple) and entry
+                        else None
+                    )
+                    if agent is not None and id(agent) in running_ids:
+                        continue  # active mid-turn; skip like the count valve
+                    est = _agent_cache_entry_byte_estimate(entry)
+                    # Pop now: the count-valve pop loop above has already
+                    # run; deferred removal here would leave byte-hogs
+                    # resident until the next enforcement pass.
+                    _cache.pop(key, None)
+                    evict_plan.append((key, agent))
+                    total_bytes -= est
 
         remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:

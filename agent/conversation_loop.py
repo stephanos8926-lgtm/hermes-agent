@@ -58,10 +58,10 @@ from agent.message_sanitization import (
     _sanitize_structure_non_ascii,
     _sanitize_structure_surrogates,
     _sanitize_surrogates,
-    _sanitize_tools_non_ascii,
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+from hermes_cli.replay_economy import compact_tool_messages
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -2508,6 +2508,11 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # D-2: Replay Economy wire-time compaction — compact oversized tool messages
+        # before provider serialization. Runs after all message mutations and sanitization.
+        session_id = agent.session_id or ""
+        api_messages = compact_tool_messages(api_messages, session_id)
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects
@@ -5422,6 +5427,8 @@ def run_conversation(
                                     new_ctx=_reduced_ctx, old_ctx=old_ctx
                                 )
                             )
+                            # D2 deferral: time.sleep(2) blocks the turn
+                            # thread. See docs/optimization/d2-deferral-record.md.
                             time.sleep(2)
                             _retry.restart_with_compressed_messages = True
                             break
@@ -5725,6 +5732,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        # D2 deferral: see docs/optimization/d2-deferral-record.md
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -6031,6 +6039,7 @@ def run_conversation(
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                        # D2 deferral: see docs/optimization/d2-deferral-record.md
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
