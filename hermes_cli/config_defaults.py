@@ -397,6 +397,24 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
+        # Idle-silence reporting: after this many seconds of no output, poll()
+        # and list_sessions() include `silent_for_seconds`. 0 disables.
+        "idle_silence_report_seconds": 60,
+        # Foreground→background idle promotion: if a foreground command produces
+        # no output for this many ms, promote it to a tracked background
+        # ProcessSession instead of blocking the agent. 0 disables.
+        "idle_promote_timeout_ms": 60000,
+        # Don't promote if the foreground deadline is within this many seconds
+        # (prevents promoting right before a timeout-kill).
+        "promote_margin_seconds": 30,
+        # Default hard timeout for promoted/background sessions so a promoted
+        # deadlock cannot run forever (Claude Code #79175). Seconds.
+        "background_default_timeout_seconds": 900,
+        "background_max_timeout_seconds": 3600,
+        # Whether /stop should also SIGINT background sessions for the current
+        # task_id (Phase 3).
+        "interrupt_broadcast_to_background": True,
+        "interrupt_broadcast_scope": "task",  # "task" | "none"
         # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit
         # while background processes spawned with notify_on_complete=true are
         # still running. The dying parent owns those children's stdout pipes,

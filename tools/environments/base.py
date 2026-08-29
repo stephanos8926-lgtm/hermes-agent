@@ -1029,7 +1029,8 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
 
     def _wait_for_process(
-        self, proc: ProcessHandle, timeout: int = 120, *, bounded_capture: bool = False
+        self, proc: ProcessHandle, timeout: int = 120, *, bounded_capture: bool = False,
+        _promote_info: dict | None = None,
     ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -1087,6 +1088,10 @@ class BaseEnvironment(ABC):
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
+        # --- Idle-promotion bookkeeping (shared between drain thread and poll loop) ---
+        _idle_last_output_at = [time.monotonic()]  # monotonic of last chunk; init at spawn
+        _promotion_event = threading.Event()        # set when poll loop decides to promote
+
         # Non-blocking drain via select().
         #
         # The old pattern — ``for line in proc.stdout`` — blocks on
@@ -1123,12 +1128,20 @@ class BaseEnvironment(ABC):
             # silently, losing all of the process's output.
             try:
                 for piece in stream:
+                    if _promotion_event.is_set():
+                        break
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output.append(decoder.decode(piece))
+                        decoded = decoder.decode(piece)
+                        output.append(decoded)
+                        if decoded:
+                            _idle_last_output_at[0] = time.monotonic()
                     else:
-                        output.append(str(piece))
+                        txt = str(piece)
+                        output.append(txt)
+                        if txt:
+                            _idle_last_output_at[0] = time.monotonic()
             except Exception:
                 pass
             finally:
@@ -1136,6 +1149,7 @@ class BaseEnvironment(ABC):
                     tail = decoder.decode(b"", final=True)
                     if tail:
                         output.append(tail)
+                        _idle_last_output_at[0] = time.monotonic()
                 except Exception:
                     pass
 
@@ -1163,10 +1177,14 @@ class BaseEnvironment(ABC):
             if os.name == "nt":
                 try:
                     while True:
+                        if _promotion_event.is_set():
+                            break
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        decoded = decoder.decode(chunk)
+                        output.append(decoded)
+                        _idle_last_output_at[0] = time.monotonic()
                 except (ValueError, OSError):
                     pass
                 finally:
@@ -1174,12 +1192,15 @@ class BaseEnvironment(ABC):
                         tail = decoder.decode(b"", final=True)
                         if tail:
                             output.append(tail)
+                            _idle_last_output_at[0] = time.monotonic()
                     except Exception:
                         pass
                 return
             idle_after_exit = 0
             try:
                 while True:
+                    if _promotion_event.is_set():
+                        break
                     try:
                         ready, _, _ = select.select([fd], [], [], 0.1)
                     except (ValueError, OSError):
@@ -1191,7 +1212,9 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        decoded = decoder.decode(chunk)
+                        output.append(decoded)
+                        _idle_last_output_at[0] = time.monotonic()
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -1294,6 +1317,74 @@ class BaseEnvironment(ABC):
                     )
                     _last_heartbeat = time.monotonic()
                     _cb_was_none = _cb_now_none
+
+                # --- Idle-promotion check (foreground hung on silence) ---------
+                # Only when the caller supplied promotion context (foreground
+                # terminal path) and the Popen has a real pipe (local backend).
+                if _promote_info is not None:
+                    try:
+                        _has_pipe = getattr(getattr(proc, "stdout", None), "fileno", None) is not None
+                    except Exception:
+                        _has_pipe = False
+                    if _has_pipe and proc.poll() is None:
+                        try:
+                            from hermes_cli.config_defaults import DEFAULT_CONFIG as _DC
+                            from hermes_cli.config import read_raw_config as _rrc, cfg_get as _cg
+                            _cfg = _rrc()
+                            _promote_ms = _cg(_cfg, "terminal", "idle_promote_timeout_ms")
+                            if _promote_ms is None:
+                                _promote_ms = _DC["terminal"]["idle_promote_timeout_ms"]
+                            _promote_ms = float(_promote_ms)
+                            _margin = _cg(_cfg, "terminal", "promote_margin_seconds")
+                            if _margin is None:
+                                _margin = _DC["terminal"]["promote_margin_seconds"]
+                            _margin = float(_margin)
+                        except Exception:
+                            _promote_ms = 60000.0
+                            _margin = 30.0
+                        if _promote_ms > 0:
+                            now = time.monotonic()
+                            idle_s = now - _idle_last_output_at[0]
+                            remaining = deadline - now
+                            if idle_s * 1000.0 >= _promote_ms and remaining > _margin:
+                                _promotion_event.set()
+                                try:
+                                    drain_thread.join(timeout=0.5)
+                                except Exception:
+                                    pass
+                                partial = output.render()
+                                try:
+                                    from tools.process_registry import process_registry as _pr
+                                    sess = _pr.adopt_foreground(
+                                        proc,
+                                        command=_promote_info.get("command", "<foreground>"),
+                                        cwd=_promote_info.get("cwd"),
+                                        task_id=_promote_info.get("task_id", ""),
+                                        session_key=_promote_info.get("session_key", ""),
+                                        initial_output=partial,
+                                        spawn_monotonic=_promote_info.get("spawn_monotonic", 0) or _idle_last_output_at[0],
+                                        last_output_at=_idle_last_output_at[0],
+                                    )
+                                    result = self._finalize_wait_result(output, partial, None)
+                                    result["promoted"] = True
+                                    result["session_id"] = sess.id
+                                    result["silent_for_seconds"] = int(idle_s)
+                                    result["promotion_reason"] = "idle_silence"
+                                    result["hint"] = (
+                                        f"Command produced no output for {int(idle_s)}s and was promoted "
+                                        f"to background (session_id={sess.id}). It may be waiting for input "
+                                        f"or genuinely hung. Use process(action='poll') to check, "
+                                        f"process(action='write'/'submit') if it needs input, or "
+                                        f"process(action='kill') if stuck."
+                                    )
+                                    return result
+                                except Exception as _pe:
+                                    try:
+                                        import logging as _lg2
+                                        _lg2.getLogger(__name__).warning("idle promotion failed: %s", _pe)
+                                    except Exception:
+                                        pass
+                                    _promotion_event.clear()
 
                 # Adaptive poll: start at 5ms so fast commands (echo, pwd,
                 # date, cat short files) return in ~6ms instead of being
@@ -1459,6 +1550,7 @@ class BaseEnvironment(ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
+        _promote_info: dict | None = None,
     ) -> dict:
         """Execute a command, return {"output": str, "returncode": int}.
 
@@ -1506,7 +1598,8 @@ class BaseEnvironment(ABC):
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
         )
         result = self._wait_for_process(
-            proc, timeout=effective_timeout, bounded_capture=bounded_capture
+            proc, timeout=effective_timeout, bounded_capture=bounded_capture,
+            _promote_info=_promote_info,
         )
         self._update_cwd(result)
 

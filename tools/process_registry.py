@@ -415,6 +415,13 @@ class ProcessSession:
     _watch_cooldown_until: float = field(default=0.0, repr=False)
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
+    # Silence detection (monotonic clock): last time ANY output was appended.
+    # 0.0 = no output yet (silent since started_at). Used by idle-silence
+    # reporting and foreground→background promotion.
+    last_output_at: float = field(default=0.0, repr=False)
+    # Monotonic timestamp at spawn, for silent-since-start calculation when
+    # last_output_at==0. Set in spawn_local/spawn_via_env.
+    spawn_monotonic: float = field(default=0.0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -513,6 +520,158 @@ class ProcessRegistry:
             sink(session, chunk)
         except Exception:
             pass
+
+    def _stamp_output(self, session: ProcessSession) -> None:
+        """Record monotonic time of last output append (silence tracking)."""
+        try:
+            session.last_output_at = time.monotonic()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _idle_silence_report_seconds() -> float:
+        """Read idle_silence_report_seconds from config (0 disables)."""
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "idle_silence_report_seconds")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["idle_silence_report_seconds"]
+            return max(float(val), 0.0)
+        except Exception:
+            return 60.0
+
+    def _compute_silent_fields(self, session: ProcessSession) -> dict:
+        """Return silent_for_seconds fields if threshold exceeded, else {}."""
+        threshold = self._idle_silence_report_seconds()
+        if threshold <= 0:
+            return {}
+        try:
+            if session.last_output_at > 0:
+                silent = time.monotonic() - session.last_output_at
+            elif session.spawn_monotonic > 0:
+                silent = time.monotonic() - session.spawn_monotonic
+            else:
+                # Fallback: wall-clock elapsed (pre-migration sessions)
+                silent = time.time() - session.started_at
+            if silent >= threshold:
+                return {"silent_for_seconds": int(silent)}
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _idle_promote_timeout_ms() -> float:
+        """Read idle_promote_timeout_ms from config (0 disables)."""
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "idle_promote_timeout_ms")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["idle_promote_timeout_ms"]
+            return max(float(val), 0.0)
+        except Exception:
+            return 60000.0
+
+    @staticmethod
+    def _promote_margin_seconds() -> float:
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "promote_margin_seconds")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["promote_margin_seconds"]
+            return max(float(val), 0.0)
+        except Exception:
+            return 30.0
+
+    @staticmethod
+    def _background_default_timeout_seconds() -> float:
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "background_default_timeout_seconds")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["background_default_timeout_seconds"]
+            return max(float(val), 0.0)
+        except Exception:
+            return 900.0
+
+    def adopt_foreground(
+        self,
+        proc: Any,
+        command: str,
+        cwd: str = None,
+        task_id: str = "",
+        session_key: str = "",
+        initial_output: str = "",
+        spawn_monotonic: float = 0.0,
+        last_output_at: float = 0.0,
+    ) -> ProcessSession:
+        """Adopt a live foreground Popen into the registry as a tracked background session.
+
+        Used by the idle-promotion path in BaseEnvironment._wait_for_process:
+        when a foreground command goes silent, the live Popen is handed off here
+        instead of being killed. The process is never killed; it keeps running
+        and its output is now tracked via the normal background reader loop.
+
+        Only for local Popen handles. Sandbox backends have no live handle to adopt.
+        """
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id or "",
+            session_key=session_key or "",
+            cwd=cwd or os.getcwd(),
+            started_at=time.time(),
+            spawn_monotonic=spawn_monotonic or time.monotonic(),
+            last_output_at=last_output_at or 0.0,
+            output_buffer=initial_output or "",
+        )
+        # Attach the live Popen so kill/write/close continue to work.
+        try:
+            session.process = proc
+            session.pid = getattr(proc, "pid", None)
+            session.host_start_time = self._safe_host_start_time(session.pid) if session.pid else None
+        except Exception:
+            pass
+        # If we already have buffered output, mark the silence clock.
+        if initial_output and session.last_output_at == 0.0:
+            session.last_output_at = time.monotonic()
+        # Default hard timeout so a promoted deadlock cannot run forever.
+        # The caller (terminal_tool) may also enforce its own timeout; this
+        # is the registry-level backstop.
+        # Start reader loop that drains the live stdout pipe into output_buffer.
+        # Only valid when the Popen has a real pipe (local backend).
+        try:
+            has_pipe = getattr(getattr(proc, "stdout", None), "fileno", None) is not None
+        except Exception:
+            has_pipe = False
+        if has_pipe and not getattr(proc, "stdout", None) is None:
+            try:
+                reader = threading.Thread(
+                    target=self._reader_loop,
+                    args=(session,),
+                    daemon=True,
+                    name=f"proc-adopt-reader-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+            except Exception as exc:
+                logger.warning("adopt_foreground reader start failed for %s: %s", session.id, exc)
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        self._write_checkpoint()
+        logger.info(
+            "Adopted foreground pid=%s command=%r as %s (silent promotion)",
+            session.pid, command[:120], session.id,
+        )
+        return session
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -1006,6 +1165,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            spawn_monotonic=time.monotonic(),
         )
 
         pty_scope_attempted = False
@@ -1236,6 +1396,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
+            spawn_monotonic=time.monotonic(),
             env_ref=env,
             pid_scope="sandbox",
         )
@@ -1353,6 +1514,7 @@ class ProcessRegistry:
                 session.output_buffer += chunk
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._stamp_output(session)
             self._check_watch_patterns(session, chunk)
             self._emit_output(session, chunk)
 
@@ -1466,6 +1628,7 @@ class ProcessRegistry:
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
+                        self._stamp_output(session)
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
@@ -1514,6 +1677,7 @@ class ProcessRegistry:
                 session.output_buffer += text
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._stamp_output(session)
             self._check_watch_patterns(session, text)
             self._emit_output(session, text)
 
@@ -2014,6 +2178,11 @@ class ProcessRegistry:
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
         }
+        # Silence reporting (Phase 1): surface silent_for_seconds when idle
+        # exceeds idle_silence_report_seconds. Running sessions only; exited
+        # sessions are not silent (they completed).
+        if not session.exited:
+            result.update(self._compute_silent_fields(session))
         if session.exited:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason
@@ -2492,6 +2661,8 @@ class ProcessRegistry:
                 entry["watch_hit"] = s._watch_hits > 0
             if s.notify_on_complete:
                 entry["notify_on_complete"] = True
+            if not s.exited:
+                entry.update(self._compute_silent_fields(s))
             if s.exited:
                 entry["exit_code"] = s.exit_code
             if s.detached:
@@ -2500,6 +2671,49 @@ class ProcessRegistry:
         return result
 
     # ----- Session/Task Queries (for gateway integration) -----
+
+    def broadcast_interrupt(self, task_id: str | None = None) -> int:
+        """Phase 3: send SIGINT to running background sessions for interrupt.
+
+        Called from AIAgent.interrupt when terminal.interrupt_broadcast_to_background
+        is enabled. Scoped to ``task_id`` so a dev server started under a
+        different task is not killed. If task_id is None/empty, no-op.
+        Respects terminal.daemon_term_grace_seconds for SIGKILL escalation.
+        Returns count of sessions signalled.
+        """
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG
+            from hermes_cli.config import read_raw_config, cfg_get
+            cfg = read_raw_config()
+            enabled = cfg_get(cfg, "terminal", "interrupt_broadcast_to_background")
+            if enabled is None:
+                enabled = DEFAULT_CONFIG["terminal"]["interrupt_broadcast_to_background"]
+            if not bool(enabled):
+                return 0
+            scope = cfg_get(cfg, "terminal", "interrupt_broadcast_scope")
+            if scope is None:
+                scope = DEFAULT_CONFIG["terminal"]["interrupt_broadcast_scope"]
+            if str(scope) == "none":
+                return 0
+        except Exception:
+            pass
+        if not task_id:
+            return 0
+        # Collect targets under lock, then kill outside lock (kill_process acquires its own lock)
+        with self._lock:
+            targets = [s.id for s in self._running.values() if s.task_id == task_id and not s.exited]
+        killed = 0
+        for sid in targets:
+            try:
+                res = self.kill_process(sid)
+                if res.get("status") in ("killed", "already_exited"):
+                    killed += 1
+            except Exception:
+                pass
+        if killed:
+            import logging as _lg
+            _lg.getLogger(__name__).info("broadcast_interrupt task=%s killed %d sessions", task_id, killed)
+        return killed
 
     def has_active_processes(self, task_id: str) -> bool:
         """Check if there are active (running) processes for a task_id."""

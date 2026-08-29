@@ -3077,6 +3077,7 @@ def terminal_tool(
                         default_cwd=cwd,
                         session_key=session_key,
                     )
+                    _promote_spawn_mono = time.monotonic()
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -3086,6 +3087,13 @@ def terminal_tool(
                         # Internal env.execute() consumers (file ops cat
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
+                        "_promote_info": {
+                            "command": command,
+                            "cwd": command_cwd,
+                            "task_id": effective_task_id or "",
+                            "session_key": session_key or "",
+                            "spawn_monotonic": _promote_spawn_mono,
+                        },
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
@@ -3132,6 +3140,58 @@ def terminal_tool(
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
             if not workdir:
                 record_session_cwd(session_key, getattr(env, "cwd", None))
+
+            # --- Idle-promotion early return -----------------------------------
+            # _wait_for_process signals promotion with promoted=True instead of
+            # a normal exit. Surface it as a background session the agent can
+            # manage (poll/write/kill) rather than killing the hung process.
+            if result.get("promoted"):
+                _partial = result.get("output", "")
+                # Apply minimal post-processing to partial output so hints
+                # don't leak secrets or ANSI.
+                try:
+                    from tools.ansi_strip import strip_ansi as _sa
+                    _partial = _sa(_partial) if _partial else ""
+                except Exception:
+                    pass
+                try:
+                    from agent.redact import redact_terminal_output as _rto
+                    _partial = _rto(_partial.strip(), command) if _partial else ""
+                except Exception:
+                    _partial = _partial.strip() if _partial else ""
+                _promo = {
+                    "output": _partial,
+                    "exit_code": None,
+                    "promoted": True,
+                    "session_id": result.get("session_id"),
+                    "silent_for_seconds": result.get("silent_for_seconds"),
+                    "promotion_reason": result.get("promotion_reason", "idle_silence"),
+                    "hint": result.get("hint", ""),
+                }
+                # Include spill handle if the foreground collector overflowed
+                if result.get("full_output_path"):
+                    _promo["full_output_path"] = result.get("full_output_path")
+                    _promo["output_total_chars"] = result.get("output_total_chars")
+                # Record cwd if we observed a change (same as normal path)
+                try:
+                    post_cwd = getattr(env, "cwd", None)
+                    if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
+                        _promo["cwd"] = str(post_cwd)
+                except Exception:
+                    pass
+                # Ensure output fits model limits (reuse truncation helper)
+                try:
+                    from tools.tool_output_limits import get_max_bytes
+                    _max = get_max_bytes()
+                    if len(_promo["output"]) > _max:
+                        _hc = int(_max * 0.4)
+                        _tc = _max - _hc
+                        _om = len(_promo["output"]) - _hc - _tc
+                        _note = f"\n\n... [OUTPUT TRUNCATED - {_om} chars omitted out of {len(_promo['output'])} total] ...\n\n"
+                        _promo["output"] = _promo["output"][:_hc] + _note + _promo["output"][-_tc:]
+                except Exception:
+                    pass
+                return json.dumps(_promo, ensure_ascii=False)
 
             # Extract output
             output = result.get("output", "")
