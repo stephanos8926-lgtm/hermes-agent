@@ -1479,6 +1479,12 @@ def apply_database_pragmas(
     * ``temp_store`` — 0=DEFAULT(file), 1=FILE, 2=MEMORY, 3=ALWAYS
     * ``wal_autocheckpoint`` — WAL auto-checkpoint threshold in pages
     * ``journal_size_limit`` — max journal/WAL size in bytes
+    * ``busy_timeout_ms`` — SQLite busy_timeout in milliseconds
+      (default in Python ``sqlite3.connect`` is 5000; 0 = wait forever).
+      Applied to ALL connection types (writer, read_only, WAL readers).
+      Recommendation: 5000 ms for single-user gateways, 30000+ ms for
+      multi-process hammer workloads. 0 disables the busy handler entirely
+      (legacy behavior, NOT recommended).
 
     Best-effort: config load or pragma failures are ignored so DB init
     never breaks on a malformed ``database:`` section.
@@ -1517,6 +1523,28 @@ def apply_database_pragmas(
             conn.execute(f"PRAGMA {pragma_name}={value}")
         except sqlite3.OperationalError:
             pass
+
+    # busy_timeout needs special handling: the SQLite PRAGMA name is
+    # ``busy_timeout`` (no suffix), but the operator-facing config key is
+    # ``busy_timeout_ms`` for clarity (mirrors how Python's sqlite3
+    # ``timeout=`` kwarg is in seconds, the PRAGMA in ms). Apply it last
+    # so an explicit config always wins over the per-connection default
+    # set by ``sqlite3.connect(timeout=...)`` at open time.
+    raw_busy = cfg_get(cfg, "database", "busy_timeout_ms", default=None)
+    if raw_busy is not None:
+        try:
+            busy_value = int(str(raw_busy).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s: ignoring non-integer database.busy_timeout_ms=%r",
+                db_label,
+                raw_busy,
+            )
+        else:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={busy_value}")
+            except sqlite3.OperationalError:
+                pass
 
 
 # ---------------------------------------------------------------------------

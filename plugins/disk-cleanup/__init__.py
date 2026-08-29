@@ -15,7 +15,7 @@ Wires three behaviours:
 
 3. ``/disk-cleanup`` slash command — manual ``status``, ``dry-run``,
    ``quick``, ``deep``, ``track``, ``forget``, ``restore``, ``purge``,
-   ``list-trash``, ``prune-logs``, ``rotate-backups``, ``vacuum-dbs``.
+   ``list-trash``.
 
 Phase 2 extension: deleted files move to quarantine
 (``$HERMES_HOME/disk-cleanup/.trash/``) with a manifest, enabling
@@ -23,9 +23,6 @@ Phase 2 extension: deleted files move to quarantine
 
 Phase 5 extension: optional Matrix notification posts a one-line cleanup
 summary to the Matrix home channel after each session-end cleanup.
-
-Phase 3.1.0 extension: log retention, backup rotation, and opt-in DB vacuum
-at session end when their respective feature gates are enabled.
 
 Replaces PR #12212's skill-plus-script design: the agent no longer
 needs to remember to run commands.
@@ -55,7 +52,7 @@ _lock = threading.Lock()
 
 # Tool-call result shapes we can parse
 _WRITE_FILE_PATH_KEY = "path"
-_TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|~/[^\s'\"`]+)")
+_TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+)")
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +168,7 @@ def _on_session_end(
     interrupted: bool = False,
     **_: Any,
 ) -> None:
-    """Run quick cleanup if any test files were tracked during this turn.
-
-    Also runs the v3.1.0 housekeeping jobs at session end:
-    log retention, backup rotation, and (opt-in) DB vacuum. Each is
-    feature-gated and never raises.
-    """
+    """Run quick cleanup if any test files were tracked during this turn."""
     # Drain both task-level and session-level buckets.  In practice only one
     # is populated per turn; the other is empty.
     drained_session = _drain("", session_id)
@@ -190,73 +182,23 @@ def _on_session_end(
         if key and key != session_id:
             _recent_test_tracks.pop(key, None)
 
-    # ---- Core ephemeral-file cleanup (gated on activity) ----
-    ran_quick = False
-    summary = None
-    if drained_session or task_buckets:
-        try:
-            summary = dg.quick()
-        except Exception as exc:
-            logger.debug("disk-cleanup quick cleanup failed: %s", exc)
-            summary = None
-        if summary and (summary["deleted"] or summary["empty_dirs"]):
-            dg._log(
-                f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
-                f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
-            )
-            ran_quick = True
-    elif not dg.should_auto_cleanup():
+    if not drained_session and not task_buckets:
         # No test files tracked this turn — only run cleanup if disk
         # pressure exceeds the configured threshold.
+        if not dg.should_auto_cleanup():
+            return
+
+    try:
+        summary = dg.quick()
+    except Exception as exc:
+        logger.debug("disk-cleanup quick cleanup failed: %s", exc)
         return
 
-    if summary is None:
-        try:
-            summary = dg.quick()
-        except Exception as exc:
-            logger.debug("disk-cleanup quick cleanup failed: %s", exc)
-            summary = None
-
-    if summary and (summary["deleted"] or summary["empty_dirs"]):
-        ran_quick = True
+    if summary["deleted"] or summary["empty_dirs"]:
         dg._log(
             f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
             f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
         )
-
-    # ---- v3.1.0: log retention ----
-    try:
-        log_report = dg.prune_old_logs()
-        if len(log_report.get("deleted", [])) > 0:
-            dg._log(
-                f"AUTO_LOG_RETENTION (session_end): "
-                f"deleted={len(log_report['deleted'])} retention_days={log_report.get('retention_days')}"
-            )
-    except Exception as exc:
-        logger.debug("disk-cleanup log retention failed: %s", exc)
-
-    # ---- v3.1.0: backup rotation ----
-    try:
-        backup_report = dg.rotate_disk_cleanup_backups()
-        if backup_report.get("deleted_count", 0) > 0:
-            dg._log(
-                f"AUTO_BACKUP_ROTATION (session_end): "
-                f"deleted={backup_report['deleted_count']}"
-            )
-    except Exception as exc:
-        logger.debug("disk-cleanup backup rotation failed: %s", exc)
-
-    # ---- v3.1.0: opt-in DB vacuum (gated by disk_cleanup.db_vacuum_enabled) ----
-    try:
-        vacuum_report = dg.auto_vacuum_dbs()
-        if vacuum_report.get("ok"):
-            dg._log(
-                f"AUTO_VACUUM (session_end): state.db + lcm.db vacuumed"
-            )
-    except Exception as exc:
-        logger.debug("disk-cleanup auto vacuum failed: %s", exc)
-
-    if ran_quick and summary is not None:
         _notify_cleanup(summary)
 
 
@@ -334,19 +276,11 @@ Subcommands:
   restore <trash_id>         Restore a quarantined item to its original path
   purge [days]               Permanently delete trash older than N days (default 30)
   list-trash                 Show all items currently in quarantine
-  prune-logs [days]          Prune rotated log files older than N days
-                             (default from disk_cleanup.log_retention_days)
-  rotate-backups [days]      Prune tracked.json.bak files older than N days
-                             (default from disk_cleanup.backup_retention_days)
-  vacuum-dbs                 Opt-in: run hermes db vacuum on state.db + lcm.db
-                             (gated by disk_cleanup.db_vacuum_enabled)
 
 Categories: temp | test | research | download | chrome-profile | cron-output | other
 
 All operations are scoped to HERMES_HOME and /tmp/hermes-*.
 Test files are auto-tracked on write_file / terminal and auto-cleaned at session end.
-Log retention, backup rotation, and DB vacuum also run automatically at session end
-when their respective feature gates are enabled.
 """
 
 
@@ -463,36 +397,6 @@ def _handle_slash(raw_args: str) -> Optional[str]:
             )
         return "\n".join(lines)
 
-    if sub == "prune-logs":
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else None
-        report = dg.prune_old_logs(days=days)
-        if report.get("skipped"):
-            return f"[disk-cleanup] log retention: skipped ({report.get('reason')})"
-        deleted_count = len(report.get("deleted", []))
-        return (
-            f"[disk-cleanup] log retention: deleted {deleted_count} files "
-            f"(kept {report.get('kept', 0)}, retention_days={report.get('retention_days')})"
-        )
-
-    if sub == "rotate-backups":
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else None
-        report = dg.rotate_disk_cleanup_backups(days=days)
-        if report.get("skipped"):
-            return f"[disk-cleanup] backup rotation: skipped ({report.get('reason')})"
-        return (
-            f"[disk-cleanup] backup rotation: scanned {report['scanned']}, "
-            f"deleted {report['deleted_count']} files (retention_days={report['retention_days']})"
-        )
-
-    if sub == "vacuum-dbs":
-        report = dg.auto_vacuum_dbs()
-        if report.get("skipped"):
-            return f"[disk-cleanup] db vacuum: skipped ({report.get('reason')})"
-        if report.get("ok"):
-            targets = ", ".join(report.get("results", {}).keys())
-            return f"[disk-cleanup] db vacuum: {targets} vacuumed"
-        return f"[disk-cleanup] db vacuum: {report}"
-
     return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
 
 
@@ -501,6 +405,10 @@ def _handle_slash(raw_args: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    ctx.add_hook("post_tool_call", _on_post_tool_call)
-    ctx.add_hook("on_session_end", _on_session_end)
-    ctx.add_slash_command("disk-cleanup", _handle_slash)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_command(
+        "disk-cleanup",
+        handler=_handle_slash,
+        description="Track and clean up ephemeral Hermes session files.",
+    )
