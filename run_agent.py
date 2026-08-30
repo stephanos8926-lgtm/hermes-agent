@@ -3407,6 +3407,14 @@ class AIAgent:
                     _set_interrupt(True, _wtid, reason=tool_interrupt_reason)
                 except Exception:
                     pass
+        # Phase 3: interrupt broadcast to background terminal sessions (task-scoped)
+        try:
+            from tools.process_registry import process_registry as _pr
+            _task = getattr(self, 'session_id', None) or getattr(self, '_gateway_session_key', None) or ''
+            if _task:
+                _pr.broadcast_interrupt(_task)
+        except Exception:
+            pass
         # Propagate interrupt to any running child agents (subagent delegation)
         with self._active_children_lock:
             children_copy = list(self._active_children)
