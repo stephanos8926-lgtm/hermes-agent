@@ -1089,8 +1089,8 @@ class BaseEnvironment(ABC):
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
         # --- Idle-promotion bookkeeping (shared between drain thread and poll loop) ---
-        _idle_last_output_at = [time.monotonic()]  # monotonic of last chunk; init at spawn
-        _promotion_event = threading.Event()        # set when poll loop decides to promote
+        _idle_last_output_at = [time.monotonic()]  # per-wait local monotonic of last chunk; init at spawn (isolated per execute, supports concurrent hangs)
+        _promotion_event = threading.Event()  # per-wait local; drain checks is_set() each iter        # set when poll loop decides to promote
 
         # Non-blocking drain via select().
         #
@@ -1353,6 +1353,12 @@ class BaseEnvironment(ABC):
                                 except Exception:
                                     pass
                                 partial = output.render()
+                                # Capture spill before _finalize closes it, so adopt can carry it (B3)
+                                _spill_preview = None
+                                try:
+                                    _spill_preview = output.close_spill() if hasattr(output, "close_spill") else None
+                                except Exception:
+                                    _spill_preview = None
                                 try:
                                     from tools.process_registry import process_registry as _pr
                                     sess = _pr.adopt_foreground(
@@ -1364,8 +1370,13 @@ class BaseEnvironment(ABC):
                                         initial_output=partial,
                                         spawn_monotonic=_promote_info.get("spawn_monotonic", 0) or _idle_last_output_at[0],
                                         last_output_at=_idle_last_output_at[0],
+                                        full_output_path=_spill_preview or "",
                                     )
                                     result = self._finalize_wait_result(output, partial, None)
+                                    # Ensure spill survives even though we previewed it (close_spill is idempotent, second call returns None, so reattach)
+                                    if _spill_preview:
+                                        result["full_output_path"] = _spill_preview
+                                        result["output_total_chars"] = getattr(output, "total_chars", len(partial))
                                     result["promoted"] = True
                                     result["session_id"] = sess.id
                                     result["silent_for_seconds"] = int(idle_s)

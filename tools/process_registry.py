@@ -422,6 +422,9 @@ class ProcessSession:
     # Monotonic timestamp at spawn, for silent-since-start calculation when
     # last_output_at==0. Set in spawn_local/spawn_via_env.
     spawn_monotonic: float = field(default=0.0, repr=False)
+    # Spill file for bounded_capture overflow (200KB cap). Carried across
+    # adopt_foreground so poll can still surface full_output_path after promotion (B3).
+    full_output_path: str = field(default="", repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -611,6 +614,7 @@ class ProcessRegistry:
         initial_output: str = "",
         spawn_monotonic: float = 0.0,
         last_output_at: float = 0.0,
+        full_output_path: str = "", 
     ) -> ProcessSession:
         """Adopt a live foreground Popen into the registry as a tracked background session.
 
@@ -630,7 +634,8 @@ class ProcessRegistry:
             started_at=time.time(),
             spawn_monotonic=spawn_monotonic or time.monotonic(),
             last_output_at=last_output_at or 0.0,
-            output_buffer=initial_output or "",
+            full_output_path=full_output_path or "",
+            output_buffer=initial_output or "", 
         )
         # Attach the live Popen so kill/write/close continue to work.
         try:
@@ -2183,6 +2188,11 @@ class ProcessRegistry:
         # sessions are not silent (they completed).
         if not session.exited:
             result.update(self._compute_silent_fields(session))
+        # Bounded overflow spill (Phase 0 hardening B3): if the foreground
+        # collector overflowed before promotion, or the background grew beyond
+        # MAX_OUTPUT_CHARS, surface the spill handle so the agent can read the tail.
+        if getattr(session, "full_output_path", ""):
+            result["full_output_path"] = session.full_output_path
         if session.exited:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason

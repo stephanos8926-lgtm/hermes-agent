@@ -1782,3 +1782,10 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Terminal hang-resilience tuning
+
+- `idle_silence_report_seconds` (default 60): threshold for `silent_for_seconds` in poll. Set 0 to disable reporting.
+- `idle_promote_timeout_ms` (default 60000): silence before foreground auto-promotes to background proc. 60s is aggressive for `npm install` - raise to 120000 in AGENTS.md or `hermes config set terminal.idle_promote_timeout_ms 120000`.
+- `promote_margin_seconds` (default 30): do not promote if deadline within margin (near timeout, let timeout win).
+- `interrupt_broadcast_scope` (task|none): task-scoped kill on /stop. Set none to disable.
