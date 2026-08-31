@@ -191,6 +191,21 @@ MEMORY_GUIDANCE = (
     "workflows belong in skills, not memory."
 )
 
+USER_PROFILE_GUIDANCE = (
+    "You have a persistent user profile across sessions. Save durable facts about "
+    "the user with the memory tool (target='user'): name, role, preferences, "
+    "corrections, and communication style. The profile is injected into every turn, "
+    "so keep it compact and focused on facts that will still matter later.\n"
+    "The built-in memory notes store is disabled — write only to the user profile "
+    "(target='user'), never target='memory'.\n"
+    "Prioritize what reduces future user steering — the most valuable entry is one "
+    "that prevents the user from having to correct or remind you again.\n"
+    "Write entries as declarative facts, not instructions to yourself. "
+    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
+    "Imperative phrasing gets re-read as a directive in later sessions and can "
+    "cause repeated work or override the user's current request."
+)
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
     "relevant cross-session context exists, use session_search to recall it before "
@@ -358,6 +373,25 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
+# Model name substrings whose sessions receive OPENAI_MODEL_EXECUTION_GUIDANCE
+# (execution discipline: tool persistence, mandatory tool use for arithmetic,
+# external-write read-back, count reconciliation, literal preservation,
+# verification-gated completion) when agent.execution_guidance is "auto".
+#
+# gpt/codex/grok are the historical set; deepseek/kimi/qwen/glm/minimax/
+# mimo/mistral were added after Composio agentic-eval traces showed the same
+# failure modes on those families (financial math in prose, no read-back after
+# external writes, identifier "repair", completeness claims despite count
+# mismatches). GLM's tool-calls-as-plain-text stall (#53847) and MiMo (#41874)
+# are covered here too. Gemini/Gemma are excluded — they get the more specific
+# GOOGLE_MODEL_OPERATIONAL_GUIDANCE block instead. Claude is excluded because
+# it does not exhibit these failure modes; users can opt any model in via
+# config.yaml `agent.execution_guidance: true` or a substring list.
+EXECUTION_GUIDANCE_MODELS = (
+    "gpt", "codex", "grok",
+    "deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral",
+)
+
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
 #   1. Stopping after a stub: writing a tiny file or running one command
@@ -438,13 +472,22 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # without tool calls, suggests workarounds instead of using existing tools,
 # replies with plans/suggestions instead of executing). The body is
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
+#
+# As of the Composio agentic-eval follow-up, the block is no longer fenced to
+# gpt/codex/grok: eval traces showed DeepSeek/Kimi doing financial math in
+# prose, skipping read-back verification after external writes, "repairing"
+# malformed identifiers, and claiming completeness despite count mismatches —
+# exactly the failure modes this block targets. The injection gate lives in
+# agent/system_prompt.py and is controlled by config.yaml
+# ``agent.execution_guidance`` (auto/true/false/list); "auto" matches the
+# EXECUTION_GUIDANCE_MODELS substring tuple below.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
     "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
+    "- If a tool returns empty, partial, or suspiciously narrow results, retry "
+    "with a broader or different query or strategy before concluding.\n"
     "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
     "the result.\n"
     "</tool_persistence>\n"
@@ -487,7 +530,29 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
     "confirm scope before executing.\n"
+    "- Completion: 'done' means every named acceptance criterion is verified — "
+    "never a plausible subset. Completing your plan is not itself the answer; "
+    "the requested output must appear in your response.\n"
     "</verification>\n"
+    "\n"
+    "<external_state_verification>\n"
+    "- After any state-changing write to an external system (API call, message "
+    "post, record update), verify the effect by reading back the exact target "
+    "before claiming success — a successful tool call is not a successful task. "
+    "Do NOT re-verify internal file edits a tool already confirmed.\n"
+    "- Declared totals in responses (total, reply_count, has_more, '...N more') "
+    "are hard assertions. If your enumerated count disagrees, re-fetch or parse "
+    "programmatically — never finalize on 'go with what I have'.\n"
+    "- When building write payloads, set fields explicitly rather than relying "
+    "on provider defaults that could contradict intent.\n"
+    "</external_state_verification>\n"
+    "\n"
+    "<literal_preservation>\n"
+    "- Preserve identifiers, commands, and values exactly as given — never "
+    "'repair' or normalize a token that fails a stated format. A successful "
+    "lookup does not validate a malformed source token; validate format first, "
+    "then look up.\n"
+    "</literal_preservation>\n"
     "\n"
     "<missing_context>\n"
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
@@ -2292,6 +2357,96 @@ def load_soul_md(
         return None
 
 
+# ---------------------------------------------------------------------------
+# C7: L1 memo for context-file loaders
+#
+# build_context_files_prompt() fires on every turn and each loader walks
+# directories + reads files whose content rarely changes mid-session.
+# Memoize keyed on (loader, cwd, context_length, stat-signature) where the
+# signature covers every candidate file's (mtime_ns, size). Any edit,
+# rename, addition, or removal produces a new signature -> fresh read.
+# In-place edits change mtime_ns; coarse-mtime filesystems are covered by
+# including size. Bounded at 32 entries (FIFO).
+# ---------------------------------------------------------------------------
+_C7_CACHE: "OrderedDictType" = OrderedDict()
+_C7_CACHE_MAX = 32
+
+try:
+    from collections import OrderedDict as OrderedDictType
+except ImportError:  # pragma: no cover
+    OrderedDictType = dict
+
+
+def _c7_stat_sig(paths) -> tuple:
+    """(path, mtime_ns, size) for every path that exists."""
+    sig = []
+    for p in paths:
+        try:
+            st = p.stat()
+            sig.append((str(p), st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
+def _c7_cached(name: str, loader, cwd_path: Path,
+               context_length: Optional[int], candidates):
+    key = (name, str(cwd_path.resolve()), context_length,
+           _c7_stat_sig(candidates))
+    try:
+        hit = _C7_CACHE.get(key)
+        if hit is not None or key in _C7_CACHE:
+            return hit
+    except TypeError:  # unhashable (defensive)
+        return loader(cwd_path, context_length)
+    result = loader(cwd_path, context_length)
+    try:
+        _C7_CACHE[key] = result
+        while len(_C7_CACHE) > _C7_CACHE_MAX:
+            _C7_CACHE.pop(next(iter(_C7_CACHE)))
+    except Exception:
+        logger.debug("C7 cache store failed", exc_info=True)
+    return result
+
+
+def _load_hermes_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / n for n in [".hermes.md", "HERMES.md"]]
+    return _c7_cached("hermes_md", _load_hermes_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_agents_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    try:
+        chain = _agents_md_directory_chain(cwd_path)
+    except Exception:
+        chain = []
+    cands = [d / n for d in chain for n in ["AGENTS.md", "agents.md", "Agents.md"]]
+    return _c7_cached("agents_md", _load_agents_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_claude_md_cached(cwd_path: Path,
+                           context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / n for n in ["CLAUDE.md", "claude.md"]]
+    return _c7_cached("claude_md", _load_claude_md, cwd_path,
+                      context_length, cands)
+
+
+def _load_cursorrules_cached(cwd_path: Path,
+                             context_length: Optional[int] = None) -> str:
+    cands = [cwd_path / ".cursorrules"]
+    rules_dir = cwd_path / ".cursor" / "rules"
+    if rules_dir.is_dir():
+        try:
+            cands.extend(sorted(rules_dir.glob("*.mdc")))
+        except Exception:
+            pass
+    return _c7_cached("cursorrules", _load_cursorrules, cwd_path,
+                      context_length, cands)
+
+
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
@@ -2514,10 +2669,10 @@ def build_context_files_prompt(
     else:
         # Priority-based project context: first match wins
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
+            _load_hermes_md_cached(cwd_path, context_length)
+            or _load_agents_md_cached(cwd_path, context_length)
+            or _load_claude_md_cached(cwd_path, context_length)
+            or _load_cursorrules_cached(cwd_path, context_length)
         )
     if project_context:
         sections.append(project_context)

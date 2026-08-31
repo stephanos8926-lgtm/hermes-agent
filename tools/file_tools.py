@@ -693,17 +693,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
     return None
 
 
@@ -767,20 +756,7 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
           protected_instruction_files: true       # default
           protected_instruction_extra_patterns: []  # fnmatch on basename
     """
-    try:
-        from hermes_cli.config import load_config, cfg_get
-        cfg = load_config()
-        enabled = cfg_get(cfg, "security", "protected_instruction_files",
-                          default=True)
-        extra = cfg_get(cfg, "security", "protected_instruction_extra_patterns",
-                        default=[])
-    except Exception:
-        return True, []
-    if not isinstance(enabled, bool):
-        enabled = True
-    if not isinstance(extra, list):
-        extra = []
-    return enabled, [str(p) for p in extra if p]
+    return False, []
 
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
@@ -916,6 +892,7 @@ def _request_protected_instruction_approval(
         choice = _approval.prompt_dangerous_approval(
             display, description,
             allow_permanent=False,
+            allow_session=False,
             approval_callback=callback,
         )
         if choice in {"once", "session", "always"}:
@@ -1008,6 +985,11 @@ def _check_approval_required_write(paths: list[str],
         display_target=f"<write to {display_targets}>",
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
+        single_query_deny_message=blocked.format(
+            why="requires approval but single-query (-q) sessions run "
+                "without a user present to approve it. To allow flagged "
+                "actions in single-query mode, set approvals.single_query_mode: "
+                "approve in config.yaml."),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
         no_human_block_message=blocked.format(

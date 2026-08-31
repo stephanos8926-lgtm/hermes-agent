@@ -132,9 +132,38 @@ class DiskCache(Generic[K]):
 
         Best-effort: any I/O or parse error, a key mismatch, or a stale entry
         all return None so the caller re-fetches.
+
+        When ``cache.secrets.enabled`` is true in config.yaml, an L1+L2
+        tiered cache (from :mod:`agent._cache`) fronts the on-disk JSON
+        for sub-millisecond reads in the steady state. The JSON is still
+        authoritative; a cache-layer failure or miss falls through to the
+        on-disk read and the result is written back to the cache layers.
         """
         if ttl_seconds <= 0:
             return None
+
+        from agent.secret_sources._cache_bridge import bridge_read
+
+        return bridge_read(
+            basename=self._basename,
+            key=key,
+            ttl_seconds=ttl_seconds,
+            key_serializer=self._key_serializer,
+            cls=CachedFetch,
+            json_fallback=lambda: self._read_json(key, ttl_seconds, home_path),
+        )
+
+    def _read_json(
+        self,
+        key: K,
+        ttl_seconds: float,
+        home_path: Optional[Path] = None,
+    ) -> Optional[CachedFetch]:
+        """The original on-disk JSON read path, now an internal helper.
+
+        This is the fallback when the tiered cache misses or is disabled.
+        Atomic-write / 0600 / TTL discipline lives here.
+        """
         path = self.path(home_path)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -163,35 +192,35 @@ class DiskCache(Generic[K]):
         self,
         key: K,
         entry: CachedFetch,
-        ttl_seconds: float,
+        ttl_seconds: float,  # accepted for backward-compat with callers; not
+                             # needed here because ``entry.fetched_at`` is
+                             # already stamped and the bridge compares against
+                             # that.
         home_path: Optional[Path] = None,
     ) -> None:
-        """Persist ``entry`` for ``key`` atomically at mode ``0600``.
+        """Persist a CachedFetch under ``key``. Best-effort: failures are silent.
 
-        No-op when ``ttl_seconds <= 0`` (so caching is genuinely off) or on any
-        I/O error — the next invocation just re-fetches.
+        Writes to the on-disk JSON (0600, atomic-rename). When the tiered
+        cache is enabled, also writes to L1+L2 so subsequent reads return
+        from memory. The on-disk JSON remains the cross-process / crash
+        recovery source of truth.
         """
-        if ttl_seconds <= 0:
-            return
         path = self.path(home_path)
         try:
-            cache_dir = path.parent
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             # mkdir's mode is umask-subject; chmod the dir to 0700 so cache
             # metadata isn't exposed if HERMES_HOME is ever made traversable.
             try:
-                os.chmod(cache_dir, 0o700)
+                os.chmod(path.parent, 0o700)
             except OSError:
                 pass
             payload = {
                 "key": self._key_serializer(key),
-                "secrets": entry.secrets,
-                "fetched_at": entry.fetched_at,
+                "secrets": dict(entry.secrets),
+                "fetched_at": float(entry.fetched_at),
             }
-            # Write to a sibling temp file and atomic-rename.  tempfile honours
-            # os.umask, so we explicitly chmod 0600 before the rename.
             fd, tmp = tempfile.mkstemp(
-                prefix=self._tmp_prefix, suffix=".tmp", dir=str(cache_dir)
+                prefix=self._tmp_prefix, suffix=".tmp", dir=str(path.parent)
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -205,7 +234,22 @@ class DiskCache(Generic[K]):
                     pass
                 raise
         except OSError:
-            pass  # best-effort — a disk-cache miss next invocation is fine
+            return  # best-effort — a disk-cache miss next invocation is fine
+
+        # Caching is off (caller passed ttl_seconds <= 0). Skip the L1/L2
+        # bridge too — the contract is "no caching anywhere", honoring the
+        # caller's intent to bypass every layer.
+        if ttl_seconds <= 0:
+            return
+
+        from agent.secret_sources._cache_bridge import bridge_write
+
+        bridge_write(
+            basename=self._basename,
+            key=key,
+            key_serializer=self._key_serializer,
+            entry=entry,
+        )
 
     def clear(self, home_path: Optional[Path] = None) -> None:
         """Delete the on-disk cache file if present (idempotent)."""

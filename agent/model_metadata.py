@@ -158,6 +158,14 @@ _ENDPOINT_MODEL_CACHE_TTL = 300
 # of being pinned to the stale type for the whole process lifetime.
 # Values are (server_type, monotonic_timestamp).
 _ENDPOINT_PROBE_TTL_SECONDS = 3600.0
+# A failed probe verdict (server_type is None — no known endpoint answered)
+# is cached for a much shorter window: the in-memory entry exists only to
+# keep one image-bearing turn from re-running the 5-request waterfall on
+# every subsequent turn (#89863 — a keyed remote endpoint answered 401 to
+# each leg and the None verdict was never cached, so every turn re-probed).
+# Short TTL keeps a transient failure (server starting up, key being fixed)
+# recoverable within minutes instead of pinning "undetected" for an hour.
+_ENDPOINT_PROBE_FAILURE_TTL_SECONDS = 300.0
 _endpoint_probe_path_cache: Dict[str, tuple] = {}
 
 # A configured endpoint that is routable-but-dead — e.g. a corp LAN address
@@ -501,13 +509,19 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://platform.minimax.io/docs/api-reference/text-chat-openai
     "minimax-m3": 1000000,
     "minimax": 204800,
-    # GLM — GLM-5.2 ships with a 1M context window (verified empirically:
-    # needle-in-a-haystack retrieval at 789K prompt tokens succeeded with
-    # zero errors on api.z.ai/api/coding/paas/v4).  Older GLM models
-    # (5, 5.1, 5-turbo) are ~202K.  Longest-key-first substring matching
-    # ensures "glm-5.2" resolves to 1M while older variants still hit the
-    # generic 202K fallback.
+    # GLM — GLM-5.2 and GLM-5.3 ship with a 1M context window.  GLM-5.2 was
+    # verified empirically (needle-in-a-haystack retrieval at 789K prompt
+    # tokens succeeded with zero errors on api.z.ai/api/coding/paas/v4).
+    # GLM-5.3 uses the same base model (all gains are post-training) with
+    # 1M context / 128K max output per docs.z.ai/guides/llm/glm-5.3
+    # (verified 2026-08-14).  Older GLM models (5, 5.1, 5-turbo) are ~202K.
+    # Longest-key-first substring matching ensures "glm-5.2"/"glm-5.3"
+    # resolve to 1M while older variants still hit the generic 202K fallback.
     "glm-5.2": 1_048_576,
+    # OpenRouter's free GLM-5.2 variant is capped at 256K (live metadata,
+    # 2026-08-21) — longer key wins over the 1M paid entry above.
+    "glm-5.2:free": 256_000,
+    "glm-5.3": 1_048_576,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Hermes from probing-down to
@@ -556,8 +570,22 @@ DEFAULT_CONTEXT_LENGTHS = {
     "hy3-preview": 262144,
     # Tencent — Hy3 (GA successor to Hy3 Preview), same 256K window.
     "hy3": 262144,
+    # OpenCode Zen — "Ox Alpha" stealth model (x-preview-f-free). 1M context
+    # per OpenCode's launch announcement (2026-08-20); free, ZDR.
+    "x-preview-f": 1_048_576,
+    # OpenRouter — same "Ox Alpha" stealth model under its OpenRouter slug
+    # (stealth/ox-alpha). 1M context per OpenRouter live metadata (2026-08-20).
+    "ox-alpha": 1_048_576,
     # Nemotron — NVIDIA's open-weights series (128K context across all sizes)
+    # EXCEPT 3.5 Lightning, which ships a 1M window (OpenRouter live metadata
+    # + OpenCode Zen free tier, verified 2026-08-21).
+    "nemotron-3.5-lightning": 1_000_000,
     "nemotron": 131072,
+    # Poolside Laguna 2.1 (s/xs) — 256K window per OpenRouter live metadata
+    # (2026-08-21). Covers laguna-s-2.1:free, laguna-xs-2.1:free, and the
+    # OpenCode Zen laguna-s-2.1-free slug via substring matching.
+    "laguna-s-2.1": 262144,
+    "laguna-xs-2.1": 262144,
     # Arcee
     "trinity": 262144,
     # OpenRouter
@@ -989,8 +1017,18 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     lmstudio_url = _lmstudio_server_root(normalized)
 
     cached = _endpoint_probe_path_cache.get(server_url)
-    if cached is not None and (time.monotonic() - cached[1]) < _ENDPOINT_PROBE_TTL_SECONDS:
-        return cached[0]
+    if cached is not None:
+        # Positive verdicts live for the full TTL; a None verdict (probe
+        # waterfall answered nothing recognizable) gets the short failure
+        # TTL so it still throttles re-probing without pinning the
+        # endpoint as undetected for a whole hour (#89863).
+        ttl = (
+            _ENDPOINT_PROBE_TTL_SECONDS
+            if cached[0] is not None
+            else _ENDPOINT_PROBE_FAILURE_TTL_SECONDS
+        )
+        if (time.monotonic() - cached[1]) < ttl:
+            return cached[0]
 
     # The host already blackholed a connect: skip the waterfall below, each leg
     # of which would otherwise burn its full 2s timeout. Deliberately NOT
@@ -1069,6 +1107,12 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     if result is not None:
         _endpoint_probe_path_cache[server_url] = (result, time.monotonic())
         _local_probe_disk_put("server_type", server_url, result)
+    else:
+        # Cache the negative verdict in memory only (never on disk — a
+        # failure is often transient: server starting, key being fixed)
+        # so the very next turn does not re-run the whole waterfall
+        # against an endpoint that just answered nothing (#89863).
+        _endpoint_probe_path_cache[server_url] = (None, time.monotonic())
     return result
 
 
@@ -1450,6 +1494,66 @@ def _get_context_cache_path() -> Path:
     return get_hermes_home() / "context_length_cache.yaml"
 
 
+# L1 in-process cache mirroring the on-disk context_length_cache.yaml.
+# Added in cache C2 to drop the YAML read+parse on every get_cached_context_length
+# call (which fires many times per turn via get_model_info). The YAML remains
+# the cross-process source of truth; the L1 is an acceleration layer.
+#
+# Configurable via cache.model_metadata.* (off by default). When the section
+# is absent the L1 is a tiny LRU(64) with no L2 / L3 involvement.
+# HERMES_CACHE_MODEL_METADATA_ENABLED env-var override is honored.
+#
+# The cache is best-effort: any L1 exception falls through to the YAML
+# source of truth, which is the same contract the YAML loader honors.
+def _get_context_cache_l1():
+    """Return the module-level L1 cache (lazy init, never raises).
+
+    The L1 is bounded by entry count (default 256) to bound RAM. Per the
+    InProcessLRUCache contract, eviction is LRU. The byte budget is set
+    to 8 MiB which comfortably holds 256 ``model@base_url`` keys plus
+    integer values.
+    """
+    global _CONTEXT_CACHE_L1
+    try:
+        if _CONTEXT_CACHE_L1 is None:
+            from agent._cache import InProcessLRUCache
+            try:
+                from hermes_cli.config import load_config_readonly
+                cfg = load_config_readonly() or {}
+                mm = (cfg.get("cache") or {}).get("model_metadata") or {}
+                max_entries = int(mm.get("l1_max_entries", 256))
+                max_bytes = int(mm.get("l1_max_bytes", 8 * 1024 * 1024))
+            except Exception:
+                max_entries, max_bytes = 256, 8 * 1024 * 1024
+            # Floor the bounds so a misconfigured config never creates a
+            # degenerate cache.
+            if max_entries < 1:
+                max_entries = 1
+            if max_bytes < 1024:
+                max_bytes = 1024
+            _CONTEXT_CACHE_L1 = InProcessLRUCache(
+                max_entries=max_entries,
+                max_bytes=max_bytes,
+            )
+    except Exception as e:
+        logger.debug("Failed to init context cache L1: %s", e)
+        _CONTEXT_CACHE_L1 = None
+    return _CONTEXT_CACHE_L1
+
+
+# ``None`` means "not yet initialized" — _get_context_cache_l1() will populate.
+_CONTEXT_CACHE_L1: Optional["InProcessLRUCache"] = None
+
+
+# Set of keys for which the most recent L1 invalidate attempt failed.
+# When a key is in this set, get_cached_context_length MUST skip the L1
+# and consult YAML directly. The set is cleared (per key) the moment a
+# get falls through to YAML, so it only ever blocks one read per failed
+# invalidate. This is the defensive layer that keeps a single
+# L1.invalidate() exception from resurrecting a stale value.
+_CONTEXT_L1_TOMBSTONES: set = set()
+
+
 def _load_context_cache() -> Dict[str, int]:
     """Load the model+provider -> context_length cache from disk."""
     path = _get_context_cache_path()
@@ -1492,8 +1596,26 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     if cache.get(key) == length:
-        return  # already stored
+        # Mirror the value to L1 so the next read doesn't have to consult
+        # the YAML at all. The disk write is skipped because the value
+        # is already persisted.
+        l1 = _get_context_cache_l1()
+        if l1 is not None:
+            try:
+                l1.put(key, length)
+            except Exception as e:
+                logger.debug("L1 put (no-op path) failed: %s", e)
+        return
     cache[key] = length
+    # Write-through to L1 BEFORE the disk write so a concurrent reader
+    # never sees L1-empty + disk-pending. The disk write is the source
+    # of truth; L1 just shadows it.
+    l1 = _get_context_cache_l1()
+    if l1 is not None:
+        try:
+            l1.put(key, length)
+        except Exception as e:
+            logger.debug("L1 put failed: %s", e)
     path = _get_context_cache_path()
     try:
         # Atomic write (temp file + fsync + os.replace): a plain truncating
@@ -1511,9 +1633,42 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
 def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     """Look up a previously discovered context length for model+provider."""
     key = _context_cache_key(model, base_url)
+    # L1 fast path (cache C2): the LRU mirror means the common case is
+    # a hash-table lookup instead of a YAML read+parse. L1 hit returns
+    # immediately. The L1 is best-effort; any exception falls through.
+    #
+    # If the most recent L1 invalidate attempt failed, the key is in
+    # _CONTEXT_L1_TOMBSTONES — we MUST skip L1 here and consult YAML
+    # directly so a stale value cannot leak out of a broken invalidate.
+    # The tombstone is cleared as soon as we fall through, so it only
+    # blocks one read.
+    l1 = _get_context_cache_l1()
+    tombstoned = key in _CONTEXT_L1_TOMBSTONES
+    if l1 is not None and not tombstoned:
+        try:
+            hit = l1.get(key)
+            if hit is not None:
+                return int(hit)
+        except Exception as e:
+            logger.debug("L1 get failed, falling through to YAML: %s", e)
     cache = _load_context_cache()
+    # We fell through to YAML — clear the tombstone if any, and the L1
+    # entry we are about to repopulate is fresh.
+    if tombstoned:
+        try:
+            _CONTEXT_L1_TOMBSTONES.discard(key)
+        except Exception:
+            pass
     hit = cache.get(key)
     if hit is not None:
+        # Repopulate L1 so the next call hits. A single fall-through
+        # should fully recover the L1 — there is no reason to keep
+        # # consulting YAML once the L1 has seen a value.
+        if l1 is not None:
+            try:
+                l1.put(key, hit)
+            except Exception as e:
+                logger.debug("L1 repopulate failed: %s", e)
         return hit
     # Legacy rows written before key normalization may carry a trailing
     # slash — honor them rather than re-probing. Checked regardless of the
@@ -1524,6 +1679,21 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
         if legacy_key != key:
             hit = cache.get(legacy_key)
             if hit is not None:
+                # Repopulate the canonical key in both L1 and YAML so the
+                # next read uses the normalized form. The legacy row stays
+                # in YAML for compatibility (other processes may still
+                # hold the slashed form).
+                if l1 is not None:
+                    try:
+                        l1.put(key, hit)
+                    except Exception as e:
+                        logger.debug("L1 repopulate (legacy) failed: %s", e)
+                try:
+                    cache[key] = hit
+                    path = _get_context_cache_path()
+                    atomic_yaml_write(path, {"context_lengths": cache})
+                except Exception as e:
+                    logger.debug("YAML legacy repopulate failed: %s", e)
                 return hit
     return None
 
@@ -1531,6 +1701,26 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
     key = _context_cache_key(model, base_url)
+    # Invalidate L1 first so a concurrent reader cannot resurrect the
+    # value we are about to drop from YAML. Best-effort: an L1
+    # exception here does not block the YAML invalidation.
+    l1 = _get_context_cache_l1()
+    if l1 is not None:
+        try:
+            l1.invalidate(key)
+        except Exception as e:
+            # If the L1 invalidate itself fails, the L1 may still hold
+            # the value — which would mean the next get serves the
+            # stale value from L1 without consulting YAML. We mark the
+            # key as "tombstoned" so the next get_cached_context_length
+            # call skips L1 entirely for this key. The tombstone is
+            # cleared as soon as the get falls through to YAML, so it
+            # only ever blocks one read.
+            logger.debug("L1 invalidate failed, tombstoning key: %s", e)
+            try:
+                _CONTEXT_L1_TOMBSTONES.add(key)
+            except Exception:
+                pass
     cache = _load_context_cache()
     # Invalidation must also drop the in-memory TTL probe entries for this
     # pair — otherwise the next resolution inside the TTL window reuses the
@@ -1659,9 +1849,27 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # The input itself fits — this is purely an output-cap error, so reduce
         # max_tokens and retry; do NOT compress.
         "range of max_tokens should be" in error_lower
+    ) or (
+        # OpenAI-compatible relays may reject a request whose output cap exceeds
+        # the model's separate completion-token limit, e.g.
+        #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
+        # This is independent of the input context window.
+        "exceeds model" in error_lower
+        and "maximum output tokens" in error_lower
     )
     if not is_output_cap_error:
         return None
+
+    # Generic model-output-cap form:
+    #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
+    _m_max_output = re.search(
+        r'exceeds model(?:\'s)? maximum output tokens\s*\(?\s*(\d+)\s*\)?',
+        error_lower,
+    )
+    if _m_max_output:
+        _cap = int(_m_max_output.group(1))
+        if _cap >= 1:
+            return _cap
 
     # DashScope / Alibaba range form: "Range of max_tokens should be [1, 65536]".
     # The upper bound is the available output cap.
@@ -1726,11 +1934,28 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     # Available output = window - input. When the input alone is at or over
     # the window this stays None, so the caller correctly falls through to
     # compression instead of futilely shrinking the output cap.
+    #
+    # Caveat: when max_tokens is the BINDING constraint, vLLM does not report
+    # the real prompt size at all.  It back-computes a lower bound from the
+    # constraint itself -- "at least N input tokens" where
+    # N == window + 1 - requested_output -- so window - N is always exactly
+    # requested_output - 1.  Subtracting the caller's safety margin then walks
+    # the cap down ~65 tokens per retry while the reported input walks up by
+    # the same amount, burning every compression attempt without ever fitting.
+    # Detect that degenerate case and halve the requested cap instead: it
+    # carries the same guarantee (strictly below what was rejected) and
+    # converges in one or two retries.
     _m_vllm_input = re.search(
         r'prompt contains (?:at least )?(\d+)\s*input tokens', error_lower
     )
     if _m_ctx_tok and _m_vllm_input:
         _available = int(_m_ctx_tok.group(1)) - int(_m_vllm_input.group(1))
+        _m_requested_out = re.search(r'requested (\d+)\s*output tokens', error_lower)
+        if 'at least' in error_lower and _m_requested_out:
+            _requested_out = int(_m_requested_out.group(1))
+            if _available >= _requested_out - 1:
+                # The budget is derived from the constraint, not measured.
+                return max(1, _requested_out // 2)
         if _available >= 1:
             return _available
 
@@ -1782,6 +2007,8 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "should be" in error_lower                       # generic "max_tokens should be <= N"
         or "less than or equal" in error_lower
         or "must be" in error_lower
+        or ("exceeds model" in error_lower
+            and "maximum output tokens" in error_lower)
     )
     if not output_cap_signal:
         return False
@@ -2341,6 +2568,7 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
+    "gpt-daybreak-blue-latest": 272_000,
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
@@ -2360,9 +2588,18 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # ≥11K margin under the observed ceiling and matches the compaction point
 # Codex's own client config documents for the 1M window.
 #
-# Applied ONLY when the resolved value (live probe or fallback table) is
-# exactly the known-stale 272,000 advertisement — if OpenAI moves the
-# advertised number in either direction (the gpt-5.6 family shifted
+# OPT-IN ONLY (Aug 2026 policy, Teknium): the large window is exposed via
+# explicit ``-900k`` picker variants (e.g. ``gpt-5.6-sol-900k``) — the base
+# slugs keep the advertised 272K so the cheaper limit is the default. A
+# week of the 900K default burned through subscription usage for people
+# who never asked for it. The variant suffix is a Hermes-side alias: it is
+# stripped before the model id hits the wire (see
+# ``strip_codex_context_variant_suffix`` callers in agent/transports/codex.py
+# and agent/auxiliary_client.py).
+#
+# The bump is applied ONLY when the resolved value (live probe or fallback
+# table) is exactly the known-stale 272,000 advertisement — if OpenAI moves
+# the advertised number in either direction (the gpt-5.6 family shifted
 # 272K → 372K → 272K during July 2026), the catalog is trusted again and
 # this table is inert. ``gpt-5.6`` is a FAMILY PREFIX (sol/terra/luna and
 # dated snapshots; ``-pro`` slugs are not routable on Codex OAuth — the
@@ -2374,26 +2611,124 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {
 }
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     "gpt-5.4": 900_000,   # verified live at 900K; gpt-5.4-mini rejected 500K — excluded
+    "gpt-daybreak-blue-latest": 900_000,  # exact Daybreak/Sol alias verified at 911,276
 }
 
 # The advertised value the verified-above table is allowed to override.
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000
 
+# Hermes-side picker suffix that opts a Codex slug into the live-verified
+# large window. Never sent on the wire.
+CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"
+
+# The ONLY base slugs eligible for a ``-900k`` variant: routable,
+# live-verified models. gpt-5.6 family-prefix matching is deliberately NOT
+# used here — it would synthesize dead variants for ``-pro`` slugs (the
+# Codex backend 400s them) and accept arbitrary future descendants that
+# were never probed. Dated snapshots of the routable 5.6 bases are allowed
+# via _CODEX_900K_SNAPSHOT_RE.
+_CODEX_900K_ELIGIBLE_BASES = frozenset({
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.4",                    # exact; gpt-5.4-mini enforces 272K
+    "gpt-daybreak-blue-latest",   # verified Sol alias
+})
+_CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+_CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _bare_codex_slug(model: Optional[str]) -> str:
+    """Lowercased slug with any ``vendor/`` namespace removed.
+
+    Display/auxiliary callers pass ids like ``openai/gpt-5.6-sol-900k``;
+    the main-agent path normalizes the namespace away earlier, but this
+    resolver must accept both shapes (#92797 review).
+    """
+    return (model or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def is_codex_900k_base(model: Optional[str]) -> bool:
+    """True when *model* (a BASE slug, no suffix) may carry a ``-900k`` variant.
+
+    Single source of truth for the eligibility check — used by picker
+    synthesis, context resolution, `/model` validation, and wire stripping
+    so the four sites can never drift apart.
+    """
+    slug = _bare_codex_slug(model)
+    if not slug or slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+        return False
+    if slug in _CODEX_900K_ELIGIBLE_BASES:
+        return True
+    # Dated snapshots of the routable 5.6 bases (gpt-5.6-sol-2026-07-09).
+    for base in _CODEX_900K_SNAPSHOT_BASES:
+        if slug.startswith(base + "-") and _CODEX_900K_SNAPSHOT_RE.match(
+            slug[len(base) + 1:]
+        ):
+            return True
+    return False
+
+
+def is_codex_context_variant(model: Optional[str]) -> bool:
+    """True when the model id is a VALID ``-900k`` opt-in variant.
+
+    Requires both the suffix and an eligible base — ``gpt-5.5-900k`` is not
+    a variant, it's an invalid alias.
+    """
+    slug = _bare_codex_slug(model)
+    if not slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+        return False
+    return is_codex_900k_base(slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)])
+
+
+def strip_codex_context_variant_suffix(model: Optional[str]) -> str:
+    """Return the wire-safe slug with a VALID ``-900k`` suffix removed.
+
+    The suffix is a Hermes picker alias (``gpt-5.6-sol-900k``); the Codex
+    backend only knows the base slug. Stripping is conditional on base
+    eligibility: an ineligible alias like ``gpt-5.5-900k`` is returned
+    unchanged so it fails honestly at the API instead of silently running
+    as a different model. Case-insensitive; preserves any ``vendor/``
+    namespace prefix.
+    """
+    raw = (model or "").strip()
+    if not raw.lower().endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
+        return raw
+    base = raw[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+    if is_codex_900k_base(base):
+        return base
+    return raw
+
+
+def has_codex_context_variant(model_bare: str) -> bool:
+    """True when a Codex BASE slug should get a synthetic ``-900k`` entry.
+
+    Thin alias over :func:`is_codex_900k_base` kept for the picker call
+    sites' readability.
+    """
+    return is_codex_900k_base(model_bare)
+
 
 def _verified_codex_ctx_for_slug(model_bare: str) -> Optional[int]:
-    """Return the live-verified Codex cap for a slug, or ``None``.
+    """Return the live-verified Codex cap for an OPTED-IN slug, or ``None``.
 
-    Exact slugs first, then family prefixes (``<key>``, ``<key>-``,
-    ``<key>.``) so dated snapshots of a verified family inherit the bump.
+    The large window is opt-in: only VALID ``-900k`` picker variants
+    (e.g. ``gpt-5.6-sol-900k``) resolve to the verified cap. Base slugs
+    keep the advertised 272K so the cheaper default limit applies unless
+    the user explicitly selects the large-context variant; ineligible
+    aliases (``gpt-5.5-900k``) never resolve here.
     """
-    slug = (model_bare or "").strip().lower()
-    if not slug:
+    slug = _bare_codex_slug(model_bare)
+    if not slug.endswith(CODEX_CONTEXT_VARIANT_SUFFIX):
         return None
-    exact = _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.get(slug)
+    base = slug[: -len(CODEX_CONTEXT_VARIANT_SUFFIX)]
+    if not is_codex_900k_base(base):
+        return None
+    exact = _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT.get(base)
     if exact is not None:
         return exact
     for key, ctx in _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES.items():
-        if slug == key or slug.startswith(key + "-") or slug.startswith(key + "."):
+        if base == key or base.startswith(key + "-") or base.startswith(key + "."):
             return ctx
     return None
 
@@ -2527,8 +2862,9 @@ def _resolve_codex_oauth_context_length_with_source(
     def _apply_verified_bump(ctx: int, source: str) -> Tuple[int, str]:
         """Lift a known-stale 272K advertisement to the live-verified cap.
 
-        Only fires when the resolved value is EXACTLY the stale 272,000
-        advertisement for a slug we have probed above it (see
+        Only fires for explicit ``-900k`` picker variants (opt-in), and only
+        when the resolved value is EXACTLY the stale 272,000 advertisement
+        for a slug we have probed above it (see
         ``_verified_codex_ctx_for_slug``). Any other advertised value —
         higher or lower — is trusted as a real server-side change.
         """
@@ -2541,19 +2877,26 @@ def _resolve_codex_oauth_context_length_with_source(
             return bumped, source
         return ctx, source
 
+    # ``-900k`` variants are Hermes picker aliases — the Codex catalog only
+    # knows the base slug, so resolve against the stripped id. Also drop any
+    # ``vendor/`` namespace (``openai/gpt-5.6-sol-900k``): the main-agent
+    # path normalizes it away before reaching here, but display/auxiliary
+    # callers pass it through (#92797 review).
+    lookup_bare = _bare_codex_slug(strip_codex_context_variant_suffix(model_bare))
+
     if access_token:
         live, fresh_probe = _fetch_codex_oauth_context_lengths_with_source(access_token)
         live_source = "live" if fresh_probe else "memory"
-        if model_bare in live:
-            return _apply_verified_bump(live[model_bare], live_source)
+        if lookup_bare in live:
+            return _apply_verified_bump(live[lookup_bare], live_source)
         # Case-insensitive match in case casing drifts
-        model_lower = model_bare.lower()
+        model_lower = lookup_bare.lower()
         for slug, ctx in live.items():
             if slug.lower() == model_lower:
                 return _apply_verified_bump(ctx, live_source)
 
     # Fallback: longest-key-first substring match over hardcoded defaults.
-    model_lower = model_bare.lower()
+    model_lower = lookup_bare.lower()
     for slug, ctx in sorted(
         _CODEX_OAUTH_CONTEXT_FALLBACK.items(), key=lambda x: len(x[0]), reverse=True
     ):

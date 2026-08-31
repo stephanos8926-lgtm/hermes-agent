@@ -396,6 +396,7 @@ def cron_create(args):
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -470,6 +471,7 @@ def cron_edit(args):
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -555,6 +557,29 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             print(f"  {job['execution_skipped']}")
         else:
             print("  It will run on the next scheduler tick.")
+    return 0
+
+
+def cron_resume(args) -> int:
+    """Resume a paused job or explicitly re-arm a completed one-shot."""
+    if bool(getattr(args, "run_at", None)) == bool(getattr(args, "run_now", False)):
+        if getattr(args, "run_at", None) or getattr(args, "run_now", False):
+            print(color("Use exactly one of --at or --run-now.", Colors.RED))
+            return 1
+        return _job_action("resume", args.job_id, "Resumed")
+    from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot
+
+    run_at = _hermes_now().isoformat() if args.run_now else args.run_at
+    try:
+        job = rearm_oneshot(args.job_id, run_at)
+    except (AmbiguousJobReference, ValueError) as exc:
+        print(color(f"Failed to re-arm job: {exc}", Colors.RED))
+        return 1
+    if not job:
+        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+    print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN))
+    print(f"  Next run: {job.get('next_run_at')}")
     return 0
 
 
@@ -654,7 +679,7 @@ def cron_command(args):
         return _job_action("pause", args.job_id, "Paused")
 
     if subcmd == "resume":
-        return _job_action("resume", args.job_id, "Resumed")
+        return cron_resume(args)
 
     if subcmd == "run":
         return _job_action("run", args.job_id, "Triggered")

@@ -295,6 +295,60 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
     return ""
 
 
+def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
+    """Return doctor rows for web search/extract provider readiness (#78412).
+
+    Each row is ``(status, label, detail)`` where *status* is ``ok`` or ``warn``.
+    Uses the same active-provider resolvers as the tools, but reports readiness
+    from ``is_available()`` so an explicitly selected but unconfigured backend
+    does not look healthy.
+    """
+    rows: list[tuple[str, str, str]] = []
+    try:
+        from agent.web_search_registry import (
+            get_active_extract_provider,
+            get_active_search_provider,
+        )
+        from tools.web_tools import _ensure_web_plugins_loaded, _provider_is_ready
+
+        # Doctor runs in a fresh process — bundled web providers register
+        # during plugin discovery, which nothing has triggered yet here.
+        # Without this the registry is empty and every row reads
+        # "no provider selected or registered" (idempotent, cheap on rerun).
+        _ensure_web_plugins_loaded()
+    except Exception:
+        return rows
+
+    for capability, getter in (
+        ("web search", get_active_search_provider),
+        ("web extract", get_active_extract_provider),
+    ):
+        try:
+            provider = getter()
+        except Exception:
+            provider = None
+        if provider is None:
+            rows.append(
+                (
+                    "warn",
+                    capability,
+                    "(no provider selected or registered)",
+                )
+            )
+            continue
+        name = getattr(provider, "name", None) or type(provider).__name__
+        if _provider_is_ready(provider):
+            rows.append(("ok", capability, f"({name})"))
+        else:
+            rows.append(
+                (
+                    "warn",
+                    capability,
+                    f"({name} selected; provider not configured)",
+                )
+            )
+    return rows
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
     updated_available = list(available)
@@ -405,6 +459,18 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "info",
             "FTS tables: " + (", ".join(present) if present else "none"),
             "",
+        ))
+
+    deferral = stats.get("fts_rebuild_deferral")
+    if isinstance(deferral, dict):
+        attempts = deferral.get("attempts")
+        pids = deferral.get("holder_pids") or []
+        lines.append((
+            "warn",
+            f"state.db FTS repair is blocked after {attempts or '?'} "
+            f"deferral(s) by PID(s) {pids or 'unknown'}",
+            "(stop the listed processes, then run 'hermes sessions "
+            "optimize-storage' with the gateway stopped)",
         ))
 
     # Advisory: oversized database. Suggest auto_prune, and — when the v23
@@ -525,6 +591,46 @@ def collect_deprecated_env_vars(env_map: dict | None) -> list[tuple[str, str]]:
     return findings
 
 
+def collect_relay_plugin_cutover_findings(
+    raw_config: dict | None,
+    env_map: dict | None,
+) -> list[tuple[str, str]]:
+    """Return actionable findings for the removed Hermes Relay plugin."""
+    from hermes_cli.relay_plugin_cutover import (
+        LEGACY_RELAY_EXPORT_ENV_VARS,
+        RELAY_PLUGINS_CONFIG_ENV,
+        configured_legacy_relay_env_vars,
+        legacy_relay_plugin_keys,
+    )
+
+    findings: list[tuple[str, str]] = []
+    if isinstance(raw_config, dict):
+        plugins = raw_config.get("plugins")
+        if isinstance(plugins, dict):
+            for key in legacy_relay_plugin_keys(plugins.get("enabled")):
+                findings.append(
+                    (
+                        f"plugins.enabled: {key}",
+                        f"remove it and configure {RELAY_PLUGINS_CONFIG_ENV}",
+                    )
+                )
+
+    effective_env = dict(env_map or {})
+    for name in (*LEGACY_RELAY_EXPORT_ENV_VARS, RELAY_PLUGINS_CONFIG_ENV):
+        if name not in effective_env and os.environ.get(name) is not None:
+            effective_env[name] = os.environ[name]
+    if not str(effective_env.get(RELAY_PLUGINS_CONFIG_ENV, "")).strip():
+        for name in configured_legacy_relay_env_vars(effective_env):
+            findings.append(
+                (
+                    name,
+                    f"move exporter settings to {RELAY_PLUGINS_CONFIG_ENV}; "
+                    "this variable is now ignored",
+                )
+            )
+    return findings
+
+
 def report_deprecated_config_and_env(
     raw_config: dict | None = None,
     env_map: dict | None = None,
@@ -535,18 +641,26 @@ def report_deprecated_config_and_env(
     (empty when nothing deprecated is present). Does not mutate config/env and
     does not append to the blocking ``issues`` list.
     """
-    findings = collect_deprecated_config_keys(raw_config)
-    findings.extend(collect_deprecated_env_vars(env_map))
+    deprecated = collect_deprecated_config_keys(raw_config)
+    deprecated.extend(collect_deprecated_env_vars(env_map))
+    relay_cutover = collect_relay_plugin_cutover_findings(raw_config, env_map)
+    findings = deprecated + relay_cutover
     if not findings:
         check_ok("No deprecated config keys or env vars")
         return findings
 
-    for legacy, replacement in findings:
+    for legacy, replacement in deprecated:
         check_warn(
             f"Deprecated: {legacy}",
             f"(use {replacement} instead)",
         )
         check_info(f"Replace {legacy} → {replacement} (warn-only; not auto-migrated here)")
+    for legacy, replacement in relay_cutover:
+        check_warn(
+            f"Breaking Relay migration: {legacy}",
+            f"({replacement})",
+        )
+        check_info(f"Migrate {legacy}: {replacement}")
     return findings
 
 
@@ -676,6 +790,96 @@ def _check_s6_supervision(issues: list[str]) -> None:
         f"Per-profile gateways: {up_count}/{len(profiles)} supervised up"
         + (f" ({', '.join(sorted(profiles))})" if len(profiles) <= 8 else "")
     )
+
+
+_DISK_WARN_FREE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB free-space floor
+
+
+def _check_disk_headroom(issues: list[str]) -> None:
+    """Report free disk space on the Hermes home and project root.
+
+    A full disk fails silently: session writes, cron jobs, and the
+    gateway's state.db all degrade without a clear error. Surface free
+    space (and warn below a conservative floor) so a nearly-full disk is
+    visible before it breaks something.
+    """
+    _section("Disk Space")
+    targets: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for label, path in (
+        ("Hermes home", HERMES_HOME),
+        ("Project root", PROJECT_ROOT),
+    ):
+        try:
+            resolved = str(Path(path).resolve())
+        except OSError:
+            resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        targets.append((label, Path(path)))
+
+    for label, path in targets:
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            check_info(f"{label}: disk usage unavailable ({exc})")
+            continue
+        free = usage.free
+        total = usage.total
+        pct_free = (free / total * 100) if total else 0.0
+        if free < _DISK_WARN_FREE_BYTES:
+            check_warn(
+                f"{label}: low disk space",
+                f"({_human_bytes(free)} free of {_human_bytes(total)})",
+            )
+            issues.append(
+                f"Low disk space on {label} ({_human_bytes(free)} free) — "
+                "free up space or run 'hermes sessions optimize-storage' "
+                "(gateway stopped) to compact state.db"
+            )
+        else:
+            check_ok(
+                f"{label}: {_human_bytes(free)} free",
+                f"({pct_free:.0f}% of {_human_bytes(total)})",
+            )
+
+
+def _check_gateway_process() -> None:
+    """Report the running gateway's PID and resident memory (read-only).
+
+    Uses psutil (core dependency) to read RSS; degrades to an info line
+    when psutil is unavailable or no gateway is running. This is the
+    doctor-side counterpart to the gateway's own mem_trim telemetry.
+    """
+    _section("Gateway Process")
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        pids = list(find_gateway_pids())
+    except Exception:
+        pids = []
+    if not pids:
+        check_info("No gateway process running")
+        return
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        check_info(
+            f"Gateway running (PID {', '.join(map(str, pids))}); "
+            "RSS unavailable (psutil missing)"
+        )
+        return
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            rss = proc.memory_info().rss
+            check_ok(f"Gateway PID {pid}", f"(RSS {_human_bytes(rss)})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            check_info(
+                f"Gateway PID {pid}: RSS unavailable "
+                "(process gone or access denied)"
+            )
 
 
 def check_certificates(should_fix: bool = False, issues: "list | None" = None) -> None:
@@ -1879,6 +2083,8 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+    _check_disk_headroom(issues)
+    _check_gateway_process()
 
     if sys.platform != "win32":
         _section("Command Installation")
@@ -2787,11 +2993,26 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
-        
+
+        # Web is split into search/extract readiness rows so an explicitly
+        # selected but unconfigured backend cannot look healthy (#78412).
+        web_rows = []
+        if "web" in available or any(item.get("name") == "web" for item in unavailable):
+            web_rows = _doctor_web_capability_rows()
+            if web_rows:
+                available = [tid for tid in available if tid != "web"]
+                unavailable = [item for item in unavailable if item.get("name") != "web"]
+
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
             check_ok(info.get("name", tid), _doctor_tool_availability_detail(tid))
-        
+
+        for status, label, detail in web_rows:
+            if status == "ok":
+                check_ok(label, detail)
+            else:
+                check_warn(label, detail)
+
         for item in unavailable:
             env_vars = item.get("missing_vars") or item.get("env_vars") or []
             if env_vars:
@@ -2804,7 +3025,8 @@ def run_doctor(args):
         # current CLI platform. Default-off or explicitly disabled toolsets may
         # still show warnings above, but should not pollute the final summary.
         api_disabled = _missing_api_key_toolsets_for_summary(unavailable)
-        if api_disabled:
+        web_not_ready = any(status != "ok" for status, _, _ in web_rows)
+        if api_disabled or web_not_ready:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")

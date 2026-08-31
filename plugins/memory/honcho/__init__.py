@@ -252,10 +252,185 @@ CONCLUDE_SCHEMA = {
 }
 
 
-ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
+
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Knowledge Graph tool schemas + helpers (RapidWebs KG overlay).
+# These expose the honcho fork's Knowledge Graph side-by-side with the existing
+# honcho_* memory tools. Each tool wraps a fork KG REST endpoint.
+# ---------------------------------------------------------------------------
+import urllib.parse
+
+_KG_ENTITY_TYPE_ENUM = [
+    "person", "agent", "service", "tool", "project", "concept", "location",
+    "organization", "event", "database", "server", "system", "technology",
+    "framework", "platform", "library", "protocol", "network", "file",
+    "config", "data", "api", "command", "unknown",
+]
+
+
+def _kg_base_url(cfg) -> str:
+    url = (getattr(cfg, "base_url", None) or "").strip().rstrip("/")
+    host = (getattr(cfg, "host", None) or "").strip().rstrip("/")
+    return (url or host or "http://127.0.0.1:8000")
+
+
+def _kg_workspace(cfg) -> str:
+    ws = getattr(cfg, "workspace_id", None) or "hermes"
+    return ws if ws and ws != "default" else "hermes"
+
+
+def _kg_request(plugin, path: str, params: dict, method: str = "GET") -> dict:
+    """Perform a request to the honcho KG REST endpoint."""
+    import urllib.request
+
+    base = _kg_base_url(plugin._config)
+    ws = _kg_workspace(plugin._config)
+    qs = urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v is not None and v != ""}
+    )
+    url = f"{base}/v3/workspaces/{urllib.parse.quote(ws)}/kg{path}"
+    if qs:
+        url = f"{url}?{qs}"
+    req = urllib.request.Request(url, method=method, headers={"Accept": "application/json"})
+    api_key = getattr(plugin._config, "api_key", None)
+    if api_key and api_key not in (None, "", "local"):
+        req.add_header("Authorization", f"Bearer {api_key}")
+    timeout = 300 if method == "POST" else 45
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+KG_ENTITY_SEARCH_SCHEMA = {
+    "name": "kg_entity_search",
+    "description": (
+        "Search the RapidWebs knowledge graph for entities by name or alias "
+        "(substring/ILIKE). Use to discover what entities exist before traversing "
+        "or reasoning about connections. Returns entity name, type, aliases, "
+        "confidence, mention count. Related: kg_traverse, kg_query, honcho_search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string", "description": "Entity name or alias substring to search (min 1 char)."},
+            "entity_type": {"type": "string", "enum": _KG_ENTITY_TYPE_ENUM, "description": "Filter by entity type."},
+            "min_confidence": {"type": "number", "description": "Minimum confidence (0-1). Default 0."},
+            "limit": {"type": "integer", "description": "Max results. Default 20, max 100."},
+            "include_dormant": {"type": "boolean", "description": "Include dormant/stale entities. Default false."},
+        },
+        "required": ["q"],
+    },
+}
+
+KG_PEER_ENTITIES_SCHEMA = {
+    "name": "kg_peer_entities",
+    "description": (
+        "Get entities linked to a specific peer in the knowledge graph. Use to see "
+        "what entities a peer is associated with across sessions. Returns entity "
+        "name, type, relationship, confidence. Related: honcho_profile."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "peer_name": {"type": "string", "description": "Peer name (e.g. 'sysop', 'hermes')."},
+            "relationship_types": {"type": "string", "description": "Comma-separated relationship type filter (e.g. 'manages,operates')."},
+            "limit": {"type": "integer", "description": "Max results. Default 50, max 200."},
+        },
+        "required": ["peer_name"],
+    },
+}
+
+KG_TRAVERSE_SCHEMA = {
+    "name": "kg_traverse",
+    "description": (
+        "BFS traversal through the knowledge graph from a starting entity. Use for "
+        "multi-hop graph reasoning: find what an entity connects to and at what "
+        "depth (services, people, systems). Depth clamped to <=6. "
+        "Related: kg_entity_search, kg_subgraph, kg_query."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Starting entity name."},
+            "max_depth": {"type": "integer", "description": "Max traversal depth. Default 2, clamp <=6."},
+            "relationship_types": {"type": "string", "description": "Comma-separated relationship type filter."},
+            "entity_types": {"type": "string", "description": "Comma-separated entity type filter."},
+            "min_confidence": {"type": "number", "description": "Minimum confidence (0-1). Default 0."},
+            "limit": {"type": "integer", "description": "Max results. Default 100, max 200."},
+        },
+        "required": ["entity"],
+    },
+}
+
+KG_SUBGRAPH_SCHEMA = {
+    "name": "kg_subgraph",
+    "description": (
+        "Extract the neighborhood subgraph around a given entity. Pull the graph "
+        "neighborhood for context injection. Depth clamped to <=3. Returns entities "
+        "and relationships near the center. Related: kg_traverse."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Center entity name."},
+            "depth": {"type": "integer", "description": "Neighborhood depth. Default 1, clamp <=3."},
+            "limit": {"type": "integer", "description": "Max results. Default 100, max 200."},
+        },
+        "required": ["entity"],
+    },
+}
+
+KG_QUERY_SCHEMA = {
+    "name": "kg_query",
+    "description": (
+        "Find a path between two entities in the knowledge graph. Use to determine "
+        "how two entities are connected (e.g. 'how does honcho-db relate to "
+        "postgres-rwdn?'). Returns the shortest relationship path. Related: kg_traverse."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "from": {"type": "string", "description": "Starting (source) entity name."},
+            "to": {"type": "string", "description": "Target entity name."},
+            "max_depth": {"type": "integer", "description": "Max path depth. Default 5, max 10."},
+        },
+        "required": ["from", "to"],
+    },
+}
+
+KG_AUTO_EXTRACT_SCHEMA = {
+    "name": "kg_auto_extract",
+    "description": (
+        "Populate the knowledge graph by running entity/relationship extraction over "
+        "recent workspace messages. Build or fill the graph from conversation "
+        "history. Triggers LLM extraction on up to `limit` recent messages, then "
+        "auto-links person/agent entities to peers. Can be slow (LLM per message). "
+        "Related: kg_entity_search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Number of recent messages to process. Default 20, max 200."},
+            "min_content_length": {"type": "integer", "description": "Minimum message content length to consider. Default 40."},
+        },
+        "required": [],
+    },
+}
+
+KG_SCHEMAS = [
+    KG_ENTITY_SEARCH_SCHEMA,
+    KG_PEER_ENTITIES_SCHEMA,
+    KG_TRAVERSE_SCHEMA,
+    KG_SUBGRAPH_SCHEMA,
+    KG_QUERY_SCHEMA,
+    KG_AUTO_EXTRACT_SCHEMA,
+]
+
+ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA] + KG_SCHEMAS
+
+
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -1660,6 +1835,83 @@ class HonchoMemoryProvider(MemoryProvider):
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
                 return tool_error("Failed to save conclusion.")
+
+            elif tool_name == "kg_entity_search":
+                try:
+                    data = _kg_request(self, "/entities", {
+                        "q": (args.get("q") or "").strip(),
+                        "entity_type": args.get("entity_type"),
+                        "min_confidence": args.get("min_confidence"),
+                        "limit": args.get("limit"),
+                        "include_dormant": args.get("include_dormant"),
+                    })
+                    entities = data.get("entities", [])
+                    return json.dumps({"result": entities, "total": data.get("total", len(entities))})
+                except Exception as _e:
+                    logger.warning("kg_entity_search failed: %s", _e)
+                    return tool_error("kg_entity_search failed: %s" % _e)
+
+            elif tool_name == "kg_peer_entities":
+                try:
+                    data = _kg_request(self, "/peer-entities", {
+                        "peer_name": (args.get("peer_name") or "").strip(),
+                        "relationship_types": args.get("relationship_types"),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data.get("entities", [])})
+                except Exception as _e:
+                    logger.warning("kg_peer_entities failed: %s", _e)
+                    return tool_error("kg_peer_entities failed: %s" % _e)
+
+            elif tool_name == "kg_traverse":
+                try:
+                    data = _kg_request(self, "/traverse", {
+                        "entity": (args.get("entity") or "").strip(),
+                        "max_depth": min(int(args.get("max_depth", 2) or 2), 6),
+                        "relationship_types": args.get("relationship_types"),
+                        "entity_types": args.get("entity_types"),
+                        "min_confidence": args.get("min_confidence"),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data.get("results", [])})
+                except Exception as _e:
+                    logger.warning("kg_traverse failed: %s", _e)
+                    return tool_error("kg_traverse failed: %s" % _e)
+
+            elif tool_name == "kg_subgraph":
+                try:
+                    data = _kg_request(self, "/subgraph", {
+                        "entity": (args.get("entity") or "").strip(),
+                        "depth": min(int(args.get("depth", 1) or 1), 3),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_subgraph failed: %s", _e)
+                    return tool_error("kg_subgraph failed: %s" % _e)
+
+            elif tool_name == "kg_query":
+                try:
+                    data = _kg_request(self, "/path", {
+                        "from": (args.get("from") or "").strip(),
+                        "to": (args.get("to") or "").strip(),
+                        "max_depth": args.get("max_depth"),
+                    })
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_query failed: %s", _e)
+                    return tool_error("kg_query failed: %s" % _e)
+
+            elif tool_name == "kg_auto_extract":
+                try:
+                    data = _kg_request(self, "/extract", {
+                        "limit": args.get("limit"),
+                        "min_content_length": args.get("min_content_length"),
+                    }, method="POST")
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_auto_extract failed: %s", _e)
+                    return tool_error("kg_auto_extract failed: %s" % _e)
 
             return tool_error(f"Unknown tool: {tool_name}")
 

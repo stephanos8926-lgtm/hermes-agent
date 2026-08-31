@@ -41,6 +41,7 @@ rather than parsing the raw JSON themselves.
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from utils import atomic_json_write
 
 import requests
+
+from agent._cache import InProcessLRUCache
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,27 @@ _models_dev_retry_after: float = 0
 _models_dev_fetch_lock = threading.Lock()
 _models_dev_refresh_lock = threading.Lock()
 _models_dev_refresh_in_flight = False
+
+# L1 cache of parsed ModelInfo objects. Off by default; enabled by
+# cache.model_catalog.enabled in config.yaml or the
+# HERMES_CACHE_MODEL_CATALOG_ENABLED env-var. The L1 mirrors the existing
+# 3-tier (mem → disk → network) data cache but caches the PARSED
+# ModelInfo (i.e. what `get_model_info` returns) — a separate, smaller
+# payload than the raw registry dict, and the hot path for cost guards,
+# vision routing, and inventory checks.
+#
+# Cache key is (mdev_id, model_id, override_hash, config_version):
+#   * mdev_id, model_id — identifies the catalog entry.
+#   * override_hash — short stable digest of the relevant override dict.
+#     Different overrides (e.g. _default vs explicit per-model) produce
+#     different keys, so the cached ModelInfo can never be served
+#     against the wrong override.
+#   * config_version — the fork's _config_version integer, bumped on
+#     every config save. Any config change invalidates the entire L1 by
+#     the key being different, so we never serve a ModelInfo derived
+#     from a stale config.
+_model_catalog_l1: Optional[InProcessLRUCache] = None
+_model_catalog_l1_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1475,6 +1499,169 @@ def get_provider_info(
 # Model-level queries (rich ModelInfo)
 # ---------------------------------------------------------------------------
 
+
+# C3: L1 cache infrastructure for parsed ModelInfo objects. See the
+# module-level comment block above for the cache key contract.
+import hashlib
+import json as _json
+
+
+def _is_model_catalog_cache_enabled() -> bool:
+    """True when the operator has opted into the L1 cache of ModelInfo.
+
+    Resolution order (most specific first):
+      1. HERMES_CACHE_MODEL_CATALOG_ENABLED env var (set to "true"/"1" to enable).
+      2. cache.model_catalog.enabled in config.yaml (if loadable).
+
+    Off by default — opt-in by either the env var or the config key.
+    Failures to load the config (no HERMES_HOME, no config.yaml) are
+    treated as "not enabled" so the L1 stays inert when config loading
+    is unavailable (e.g. early boot or test isolation).
+    """
+    env_val = os.environ.get("HERMES_CACHE_MODEL_CATALOG_ENABLED", "").strip().lower()
+    if env_val in ("1", "true", "yes", "on"):
+        return True
+    if env_val in ("0", "false", "no", "off"):
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cache = cfg.get("cache") or {}
+        mc = cache.get("model_catalog") or {}
+        enabled = mc.get("enabled", False)
+        return bool(enabled)
+    except Exception as e:
+        logger.debug("L1 model catalog cache config unavailable: %s", e)
+        return False
+
+
+def _model_catalog_l1_max_entries() -> int:
+    """Read the L1 max_entries knob with safe floor and env override."""
+    floor = 16
+    default = 256
+    try:
+        raw = os.environ.get("HERMES_CACHE_MODEL_CATALOG_L1_MAX_ENTRIES")
+        if raw is not None:
+            return max(floor, int(raw))
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        return max(
+            floor,
+            int(
+                (cfg.get("cache") or {}).get("model_catalog", {}).get(
+                    "l1_max_entries", default
+                )
+            ),
+        )
+    except Exception as e:
+        logger.debug("L1 model catalog max_entries config unavailable: %s", e)
+        return default
+
+
+def _model_catalog_l1_max_bytes() -> int:
+    """Read the L1 max_bytes knob with safe floor and env override.
+
+    Defaults to 16 MiB — enough for ~256 ModelInfo dataclasses (each
+    roughly 64 KiB pickled) which covers the entire models.dev catalog
+    of ~4000 models without overspending memory.
+    """
+    floor = 1024 * 1024
+    default = 16 * 1024 * 1024
+    try:
+        raw = os.environ.get("HERMES_CACHE_MODEL_CATALOG_L1_MAX_BYTES")
+        if raw is not None:
+            return max(floor, int(raw))
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        return max(
+            floor,
+            int(
+                (cfg.get("cache") or {}).get("model_catalog", {}).get(
+                    "l1_max_bytes", default
+                )
+            ),
+        )
+    except Exception as e:
+        logger.debug("L1 model catalog max_bytes config unavailable: %s", e)
+        return default
+
+
+def _get_model_catalog_l1() -> Optional[InProcessLRUCache]:
+    """Lazy, thread-safe singleton accessor for the L1 cache.
+
+    Returns None when the cache is disabled, the import fails, or the
+    init itself raises. Every call site MUST tolerate None — fall through
+    to the existing path with no L1 involvement.
+    """
+    global _model_catalog_l1
+    if not _is_model_catalog_cache_enabled():
+        return None
+    with _model_catalog_l1_lock:
+        if _model_catalog_l1 is not None:
+            return _model_catalog_l1
+        try:
+            _model_catalog_l1 = InProcessLRUCache(
+                max_entries=_model_catalog_l1_max_entries(),
+                max_bytes=_model_catalog_l1_max_bytes(),
+            )
+            return _model_catalog_l1
+        except Exception as e:
+            logger.debug("L1 model catalog cache init failed: %s", e)
+            _model_catalog_l1 = None
+            return None
+
+
+def _override_hash(override: Optional[Dict[str, Any]]) -> str:
+    """Stable short digest of an override dict, or 'none' when absent.
+
+    The hash is included in the L1 cache key so the L1 can never serve
+    a ModelInfo derived from a different override than the one currently
+    in scope. Sorting keys in the JSON dump keeps the digest stable
+    across Python dict iteration orders.
+    """
+    if override is None:
+        return "none"
+    try:
+        encoded = _json.dumps(override, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+    except Exception as e:
+        logger.debug("override_hash failed; using 'unhashable': %s", e)
+        return "unhashable"
+
+
+def _config_version() -> int:
+    """The fork's monotonic _config_version, or 0 when unavailable.
+
+    _config_version is bumped on every config save. Including it in the
+    cache key means a config change produces a different key, so the L1
+    is implicitly invalidated (no need to track an explicit invalidation
+    set). Returns 0 when the import fails — a stable fallback rather
+    than raising, because the L1 must never break the hot path.
+    """
+    try:
+        from hermes_cli.config import _config_version as cv
+
+        return int(cv)
+    except Exception as e:
+        logger.debug("_config_version unavailable: %s", e)
+        return 0
+
+
+def _l1_key(
+    mdev_id: str, model_id: str, override_hash: str, cv: int
+) -> str:
+    """Compose the L1 cache key.
+
+    Format: 'mc:{mdev_id}:{model_id}:{override_hash}:{cv}'. The 'mc:'
+    prefix is the L1 namespace so we never collide with other L1
+    users in the same process (e.g. C2's context-length cache).
+    """
+    return f"mc:{mdev_id}:{model_id}:{override_hash}:{cv}"
+
+
 def get_model_info(
     provider_id: str, model_id: str, *, allow_network: bool = False
 ) -> Optional[ModelInfo]:
@@ -1493,10 +1680,66 @@ def get_model_info(
 
     ``allow_network`` defaults to False — model info lookup is a hot path
     (cost guard, inventory) and must never block on the network.
+
+    C3 L1 integration: an in-process LRU caches the parsed ModelInfo
+    keyed on (mdev_id, model_id, override_hash, config_version). The
+    L1 is best-effort and OFF by default; see
+    _is_model_catalog_cache_enabled() for the opt-in contract. The L1
+    is consulted first (a hit returns the cached ModelInfo
+    immediately), then the existing path runs, then a successful
+    result populates the L1. Failures of the L1 machinery (init,
+    get, put) fall through silently — caching must never break the
+    hot path.
     """
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
+    # === L1 consult (best-effort) ===
+    # Pre-compute both possible keys (catalog-hit and catalog-miss
+    # override paths). On a hit we return the cached ModelInfo
+    # without running the rest of the function. The L1 is best-effort:
+    # any exception here logs at debug and falls through to the
+    # existing path with no L1 involvement.
+    l1: Optional[InProcessLRUCache] = None
+    try:
+        l1 = _get_model_catalog_l1()
+        if l1 is not None:
+            hit_override = _override_for(
+                provider_id, model_id, catalog_hit=True
+            )
+            hit_key = _l1_key(
+                mdev_id,
+                model_id,
+                _override_hash(hit_override),
+                _config_version(),
+            )
+            cached = l1.get(hit_key)
+            if cached is not None:
+                return cached
+            miss_override = _override_for(
+                provider_id, model_id, catalog_hit=False
+            )
+            miss_key = _l1_key(
+                mdev_id,
+                model_id,
+                _override_hash(miss_override),
+                _config_version(),
+            )
+            if miss_key != hit_key:
+                cached = l1.get(miss_key)
+                if cached is not None:
+                    return cached
+    except Exception as e:
+        logger.debug("L1 model catalog consult failed: %s", e)
+        l1 = None
+
+    # Tracks the override dict that produced the returned ModelInfo, so
+    # the L1 put at the end can key the cache on the exact override
+    # the result was derived from. Set inside _from_override_alone and
+    # _with_override; read once at the single return below.
+    _used_override: Optional[Dict[str, Any]] = None
+
     def _from_override_alone() -> Optional[ModelInfo]:
+        nonlocal _used_override
         override = _override_for(provider_id, model_id, catalog_hit=False)
         if override is None:
             return None
@@ -1509,7 +1752,9 @@ def get_model_info(
             "tool_call": True,
         }
         shaped = _merge_catalog_entry_with_override(base, override)
-        return _parse_model_info(model_id, shaped, mdev_id)
+        info = _parse_model_info(model_id, shaped, mdev_id)
+        _used_override = override
+        return info
 
     # NOTE: keep the zero-argument call on the allow_network path. Dozens
     # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
@@ -1521,30 +1766,73 @@ def get_model_info(
     )
     pdata = data.get(mdev_id)
     if not isinstance(pdata, dict):
-        return _from_override_alone()
+        result = _from_override_alone()
+        if l1 is not None and result is not None:
+            _l1_put(l1, mdev_id, model_id, _used_override, result)
+        return result
 
     models = pdata.get("models", {})
     if not isinstance(models, dict):
-        return _from_override_alone()
+        result = _from_override_alone()
+        if l1 is not None and result is not None:
+            _l1_put(l1, mdev_id, model_id, _used_override, result)
+        return result
 
     def _with_override(mid: str, raw: Dict[str, Any]) -> ModelInfo:
+        nonlocal _used_override
         override = _override_for(provider_id, model_id, catalog_hit=True)
         if override is not None:
             merged = _merge_catalog_entry_with_override(raw, override)
-            return _parse_model_info(mid, merged, mdev_id)
-        return _parse_model_info(mid, raw, mdev_id)
+            info = _parse_model_info(mid, merged, mdev_id)
+        else:
+            info = _parse_model_info(mid, raw, mdev_id)
+        _used_override = override
+        return info
 
     # Exact match
     raw = models.get(model_id)
     if isinstance(raw, dict):
-        return _with_override(model_id, raw)
+        result = _with_override(model_id, raw)
+        if l1 is not None:
+            _l1_put(l1, mdev_id, model_id, _used_override, result)
+        return result
 
     # Case-insensitive fallback
     model_lower = model_id.lower()
     for mid, mdata in models.items():
         if mid.lower() == model_lower and isinstance(mdata, dict):
-            return _with_override(mid, mdata)
+            result = _with_override(mid, mdata)
+            if l1 is not None:
+                _l1_put(l1, mdev_id, model_id, _used_override, result)
+            return result
 
     # Model not in catalog — an override (explicit or _default) may still
     # provide the metadata.
-    return _from_override_alone()
+    result = _from_override_alone()
+    if l1 is not None and result is not None:
+        _l1_put(l1, mdev_id, model_id, _used_override, result)
+    return result
+
+
+def _l1_put(
+    l1: InProcessLRUCache,
+    mdev_id: str,
+    model_id: str,
+    override: Optional[Dict[str, Any]],
+    info: "ModelInfo",
+) -> None:
+    """Best-effort L1 put for a freshly resolved ModelInfo.
+
+    Computes the cache key from the actual override that produced the
+    result (not a guess) so a later call with a different override
+    does not see this entry. Wraps every operation in try/except —
+    the L1 is an acceleration layer and must never break the
+    hot path.
+    """
+    try:
+        key = _l1_key(
+            mdev_id, model_id, _override_hash(override), _config_version()
+        )
+        l1.put(key, info)
+    except Exception as e:
+        logger.debug("L1 model catalog put failed: %s", e)

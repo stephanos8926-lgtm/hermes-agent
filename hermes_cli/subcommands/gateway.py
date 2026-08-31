@@ -157,6 +157,18 @@ def build_gateway_parser(
         action="store_true",
         help="Target the Linux system-level gateway service",
     )
+    gateway_status.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_snapshot",
+        help=(
+            "Emit a versioned JSON snapshot (schema "
+            "hermes_cli.gateway_snapshot.SNAPSHOT_SCHEMA_VERSION) instead of "
+            "the human-readable status. Suitable for `jq` and for agent "
+            "consumers — keys are stable, types are documented, all fields "
+            "are present (null when unavailable)."
+        ),
+    )
     _add_compat_platform_flag(gateway_status)
 
     # gateway install
