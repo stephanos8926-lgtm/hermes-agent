@@ -10,9 +10,19 @@ Wires three behaviours:
 2. ``on_session_end`` hook — when any test files were auto-tracked
    during the just-finished turn, runs :func:`disk_cleanup.quick` and
    logs a single line to ``$HERMES_HOME/disk-cleanup/cleanup.log``.
+   Also triggers cleanup when disk pressure exceeds the configured
+   threshold, even without tracked test files.
 
 3. ``/disk-cleanup`` slash command — manual ``status``, ``dry-run``,
-   ``quick``, ``deep``, ``track``, ``forget``.
+   ``quick``, ``deep``, ``track``, ``forget``, ``restore``, ``purge``,
+   ``list-trash``.
+
+Phase 2 extension: deleted files move to quarantine
+(``$HERMES_HOME/disk-cleanup/.trash/``) with a manifest, enabling
+``restore`` and ``purge`` operations.
+
+Phase 5 extension: optional Matrix notification posts a one-line cleanup
+summary to the Matrix home channel after each session-end cleanup.
 
 Replaces PR #12212's skill-plus-script design: the agent no longer
 needs to remember to run commands.
@@ -173,7 +183,10 @@ def _on_session_end(
             _recent_test_tracks.pop(key, None)
 
     if not drained_session and not task_buckets:
-        return
+        # No test files tracked this turn — only run cleanup if disk
+        # pressure exceeds the configured threshold.
+        if not dg.should_auto_cleanup():
+            return
 
     try:
         summary = dg.quick()
@@ -186,6 +199,64 @@ def _on_session_end(
             f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
             f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
         )
+        _notify_cleanup(summary)
+
+
+def _notify_cleanup(summary: Dict[str, Any]) -> None:
+    """Best-effort notification of cleanup results.
+
+    Posts a one-line summary to the channel configured in
+    ``disk_cleanup.notify_on_cleanup`` (default: ``matrix``).  If the
+    gateway's Matrix adapter is available the message is sent there;
+    otherwise it is logged so the summary is never silently lost.
+    """
+    channel = dg.get_notify_on_cleanup()
+    if channel != "matrix":
+        return
+
+    text = (
+        f"[disk-cleanup] Cleaned {summary['deleted']} files + "
+        f"{summary['empty_dirs']} empty dirs, freed {dg.fmt_size(summary['freed'])}."
+    )
+    if summary.get("errors"):
+        text += f" {len(summary['errors'])} error(s); see cleanup.log."
+
+    # Try the live gateway Matrix adapter first (non-blocking).
+    sent = False
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    if runner is not None:
+        try:
+            from gateway.config import Platform, load_gateway_config
+            config = load_gateway_config()
+            platform = Platform.MATRIX
+            pconfig = config.platforms.get(platform)
+            if pconfig and pconfig.enabled:
+                home = config.get_home_channel(platform)
+                if home:
+                    adapter = runner.adapters.get(platform)
+                    if adapter is not None:
+                        import asyncio
+                        coro = adapter.send(
+                            chat_id=home.chat_id,
+                            content=text,
+                            metadata=None,
+                        )
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(coro)
+                        except RuntimeError:
+                            asyncio.run(coro)
+                        sent = True
+        except Exception:
+            sent = False
+
+    if not sent:
+        logger.info("disk-cleanup notification (matrix): %s", text)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +273,9 @@ Subcommands:
   deep                       Run quick, then list items that need prompts
   track <path> <category>    Manually add a path to tracking
   forget <path>              Stop tracking a path (does not delete)
+  restore <trash_id>         Restore a quarantined item to its original path
+  purge [days]               Permanently delete trash older than N days (default 30)
+  list-trash                 Show all items currently in quarantine
 
 Categories: temp | test | research | download | chrome-profile | cron-output | other
 
@@ -298,6 +372,30 @@ def _handle_slash(raw_args: str) -> Optional[str]:
             f"Removed {n} tracking entr{'y' if n == 1 else 'ies'} for {argv[1]}."
             if n else f"Not found in tracking: {argv[1]}"
         )
+
+    if sub == "restore":
+        if len(argv) < 2:
+            return "Usage: /disk-cleanup restore <trash_id>"
+        if dg.restore(argv[1]):
+            return f"Restored {argv[1]} to its original location."
+        return f"Trash entry not found or corrupt: {argv[1]}"
+
+    if sub == "purge":
+        days = int(argv[1]) if len(argv) > 1 else 30
+        n = dg.purge(older_than_days=days)
+        return f"Purged {n} trash entry{'ies' if n != 1 else ''} older than {days}d."
+
+    if sub == "list-trash":
+        entries = dg.list_trash()
+        if not entries:
+            return "Quarantine is empty."
+        lines = [f"Quarantine ({len(entries)} entries):"]
+        for e in entries:
+            lines.append(
+                f"  [{e['trash_id']}] {e['original_path']} "
+                f"({e['category']}, {e['reason']}, {e['timestamp']})"
+            )
+        return "\n".join(lines)
 
     return f"Unknown subcommand: {sub}\n\n{_HELP_TEXT}"
 

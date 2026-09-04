@@ -1,7 +1,7 @@
 name: disk-cleanup
-version: 2.0.0
-description: "Auto-track and clean up ephemeral files (test scripts, temp outputs, cron logs) created during Hermes sessions. Runs via plugin hooks — no agent action required."
-author: "@LVT382009 (original), NousResearch (plugin port)"
+version: 3.0.0
+description: "Auto-track and clean up ephemeral files (test scripts, temp outputs, cron logs) created during Hermes sessions. Files are moved to quarantine (restorable) instead of hard-deleted. Sweep scope is inclusion-only (SWEEP_ROOTS) with age-gated empty-dir removal. Disk-pressure trigger auto-runs cleanup when HERMES_HOME exceeds threshold. Optional Matrix notification on cleanup."
+author: "@LVT382009 (original), NousResearch (plugin port), RapidWebs (Phase 1-5 extension)"
 hooks:
   - post_tool_call
   - on_session_end

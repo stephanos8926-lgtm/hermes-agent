@@ -2,6 +2,8 @@ import type { HermesGitWorktree } from '@/global'
 import type { ProjectInfo, SessionInfo } from '@/hermes'
 import { normalize } from '@/lib/text'
 
+import { rankSessions } from '../order'
+
 // Session grouping is now computed authoritatively on the backend
 // (`tui_gateway/project_tree.py`, exposed via `projects.tree` /
 // `projects.project_sessions`). The desktop is a thin renderer: this module
@@ -26,14 +28,8 @@ export interface SidebarSessionGroup {
   // worktrees (`<repo>/.worktrees/t_*`) into one row, so a heavy board doesn't
   // spray hundreds of throwaway branch lanes across the sidebar.
   isKanban?: boolean
-  loadingMore?: boolean
   mode?: 'profile' | 'source' | 'workspace'
-  onLoadMore?: () => void
   sourceId?: string
-  /** Profile lanes only: the backend page was capped, so more rows exist on
-   *  disk than were loaded. Replaces the old exact `totalCount`, which cost a
-   *  COUNT(*) per profile on every sidebar refresh just to render `n/total`. */
-  hasMore?: boolean
 }
 
 /** A repo node: holds its branch/worktree lanes (`repo -> lane -> sessions`). */
@@ -62,6 +58,10 @@ export interface SidebarProjectTree {
   isNoProject?: boolean
   repos: SidebarWorkspaceTree[]
   sessionCount: number
+  // Tokens and spend over the same sessions `sessionCount` counts, summed by
+  // the backend — the tree only carries a preview of the rows themselves.
+  totalTokens?: number
+  totalCostUsd?: number
   // Max activity timestamp across the project's sessions (overview sort key).
   lastActive?: number
   // Up to N most-recent sessions for the overview preview (set by `projects.tree`).
@@ -449,7 +449,7 @@ export function sessionProjectColor(session: SessionInfo, projects: ProjectInfo[
 }
 
 const upsertSession = (rows: SessionInfo[], session: SessionInfo): SessionInfo[] =>
-  [session, ...rows.filter(row => row.id !== session.id)].sort((a, b) => b.started_at - a.started_at)
+  [session, ...rows.filter(row => row.id !== session.id)].sort((a, b) => sessionRecency(b) - sessionRecency(a))
 
 /**
  * The lane a live session belongs to WITHIN a known repo root, by path — the
@@ -497,6 +497,10 @@ export function overlayRepoLanes(
 ): SidebarWorkspaceTree {
   const repoRootKey = pathKey(repo.path)
   let changed = false
+  // Lanes that arrived with no rows are not eviction casualties — they're real
+  // structure (a `git worktree list` lane, or one whose sessions are pinned
+  // away). The prune below is only allowed to drop lanes IT emptied.
+  const emptyOnInput = new Set(repo.groups.filter(g => !g.sessions.length).map(g => g.id))
 
   // Snapshot lanes minus anything the user just deleted/archived.
   const lanes = repo.groups.map(g => {
@@ -559,11 +563,39 @@ export function overlayRepoLanes(
         (placed.isMain
           ? lanes.find(g => g.isMain && g.label.toLowerCase() === placed.label.toLowerCase())
           : undefined) ??
+        // Non-git backend heuristic (`project_tree._place_by_heuristic`): one
+        // isMain lane keyed by the folder path itself (id === path, label =
+        // basename) — not `::branch::<name>`. Live placement always emits
+        // `::branch::main` / label "main", so id+label miss and used to FORK a
+        // phantom second main lane with the same sessions. Prefer the existing
+        // path-keyed main lane when present.
+        (placed.isMain && placedKey
+          ? lanes.find(
+              g =>
+                g.isMain && pathKey(g.path) === placedKey && !g.id.includes('::branch::') && !g.id.includes('::kanban')
+            )
+          : undefined) ??
         (!placed.isMain && placedKey ? lanes.find(g => pathKey(g.path) === placedKey) : undefined)
 
       if (!lane) {
         lane = { ...placed, sessions: [] }
         lanes.push(lane)
+      }
+    }
+
+    // Evict the session from any OTHER lane the backend snapshot may have
+    // placed it in (e.g. a turn that moved the session's cwd from main to a
+    // new worktree — the overlay places it into the worktree lane, but without
+    // this eviction the stale main-lane entry persists and the session appears
+    // under both groups until the next backend tree refresh).
+    for (const g of lanes) {
+      if (g !== lane) {
+        const idx = g.sessions.findIndex(s => s.id === session.id)
+
+        if (idx >= 0) {
+          g.sessions = [...g.sessions.slice(0, idx), ...g.sessions.slice(idx + 1)]
+          changed = true
+        }
       }
     }
 
@@ -577,7 +609,7 @@ export function overlayRepoLanes(
 
   // Drop lanes emptied by eviction (the server only emits non-empty lanes; the
   // git-worktree enhancer re-adds any still-real worktree as an empty lane).
-  const groups = sortWorktreeGroups(lanes.filter(g => g.sessions.length > 0))
+  const groups = sortWorktreeGroups(lanes.filter(g => g.sessions.length > 0 || emptyOnInput.has(g.id)))
 
   return { ...repo, groups, sessionCount: groups.reduce((n, g) => n + g.sessions.length, 0) }
 }
@@ -610,6 +642,65 @@ function overlayHomeLane(
   }
 }
 
+/**
+ * Drop matching sessions from every lane (and the overview preview) of a
+ * project subtree, recounting as lanes shrink. Used to keep pinned sessions out
+ * of the project lists: a pin belongs to the Pinned section, not to both. The
+ * predicate — rather than an id set — lets the caller match a pin on its
+ * durable lineage-root id as well as the live one.
+ *
+ * Lanes SURVIVE being emptied. A worktree is structure (it exists on disk, you
+ * can still start work in it); pinning its last chat must not delete the branch
+ * from the tree — same reason the `git worktree list` enhancer injects lanes
+ * that never had a session. Only the rows move. Memo-stable: returns the same
+ * ref when nothing matched.
+ */
+export function excludeProjectSessions(
+  project: SidebarProjectTree,
+  isExcluded: (session: SessionInfo) => boolean
+): SidebarProjectTree {
+  let changed = false
+
+  const repos = project.repos.map(repo => {
+    let repoChanged = false
+
+    const groups = repo.groups.map(group => {
+      const sessions = group.sessions.filter(session => !isExcluded(session))
+
+      if (sessions.length === group.sessions.length) {
+        return group
+      }
+
+      repoChanged = true
+
+      return { ...group, sessions }
+    })
+
+    if (!repoChanged) {
+      return repo
+    }
+
+    changed = true
+
+    return { ...repo, groups, sessionCount: groups.reduce((n, group) => n + group.sessions.length, 0) }
+  })
+
+  const previewSessions = project.previewSessions?.filter(session => !isExcluded(session))
+
+  changed ||= previewSessions?.length !== project.previewSessions?.length
+
+  if (!changed) {
+    return project
+  }
+
+  return {
+    ...project,
+    previewSessions,
+    repos,
+    sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0)
+  }
+}
+
 /** Project-level overlay: {@link overlayRepoLanes} across every repo subtree. */
 export function overlayLiveLanes(
   project: SidebarProjectTree,
@@ -637,13 +728,19 @@ export function overlayLiveLanes(
   return { ...project, repos, sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0) }
 }
 
+interface PreviewOverlayOptions {
+  removed?: ReadonlySet<string>
+  /** The active sort key as an id order; recency when empty. */
+  rankIds?: string[]
+}
+
 /** Merge live sessions into per-project overview previews, keyed by project id. */
 export function overlayLivePreviews(
   projects: SidebarProjectTree[],
   live: SessionInfo[],
   explicitProjects: ProjectInfo[],
   limit: number,
-  removed: ReadonlySet<string> = new Set()
+  { removed = NO_REMOVED, rankIds }: PreviewOverlayOptions = {}
 ): Record<string, SessionInfo[]> {
   const byProject = new Map<string, SessionInfo[]>()
 
@@ -683,7 +780,9 @@ export function overlayLivePreviews(
       }
     }
 
-    out[node.id] = [...map.values()].sort((a, b) => sessionRecency(b) - sessionRecency(a)).slice(0, limit)
+    const pool = [...map.values()].sort((a, b) => sessionRecency(b) - sessionRecency(a))
+
+    out[node.id] = rankSessions(pool, rankIds).slice(0, limit)
   }
 
   return out

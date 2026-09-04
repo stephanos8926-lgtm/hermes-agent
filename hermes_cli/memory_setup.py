@@ -162,16 +162,22 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
 
     print(f"\n  Installing dependencies: {', '.join(missing)}")
 
-    from hermes_cli.tools_config import _pip_install
+    # Environment-aware install: on immutable hosted images the agent venv
+    # is sealed read-only and installs must go to the durable target on the
+    # data volume (HERMES_LAZY_INSTALL_TARGET). install_specs handles the
+    # routing/gating; on normal installs it is venv-scoped as before (NS-605).
+    from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
     try:
-        result = _pip_install(["--quiet"] + missing, timeout=120)
-        if result.returncode == 0:
+        outcome = install_specs(missing, timeout=120)
+        if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
+        elif outcome.blocked:
+            print(f"  ⚠ Cannot install {', '.join(missing)}: {outcome.reason}")
         else:
             print(f"  ⚠ Failed to install {', '.join(missing)}")
-            stderr = (result.stderr or "")[:200]
+            stderr = (outcome.stderr or "")[:200]
             if stderr:
                 print(f"    {stderr}")
             print(f"  Run manually: {manual_cmd}")
@@ -484,10 +490,11 @@ def cmd_status(args) -> None:
     user_mark = "enabled ✓" if user_profile_enabled else "disabled ✗"
 
     # Check if the memory tool is enabled for the CLI platform via the
-    # canonical resolver (handles composite toolsets like hermes-cli).
+    # canonical resolver and respects the check_fn gate when both stores are disabled.
     from hermes_cli.tools_config import _get_platform_tools
+    from tools.memory_tool import check_memory_requirements
     cli_tools = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
-    memory_tool_enabled = "memory" in cli_tools
+    memory_tool_enabled = ("memory" in cli_tools) and check_memory_requirements()
     tool_mark = "enabled ✓" if memory_tool_enabled else "disabled ✗"
 
     print("\nMemory status\n" + "─" * 40)
@@ -540,6 +547,12 @@ def cmd_status(args) -> None:
                         if url and not is_set:
                             line += f"  → {url}"
                         print(line)
+                print(
+                    "  Note: systemd/gateway services do not inherit ~/.hermes/.env —"
+                )
+                print(
+                    "        set any variables above in the service environment."
+                )
         else:
             print("\n  Plugin:    NOT installed ✗")
             print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")

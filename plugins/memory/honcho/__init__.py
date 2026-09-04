@@ -23,10 +23,35 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
+from plugins.memory.honcho.client import spawn_context_thread
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# Gateway-internal notifications can arrive through the same user-role channel
+# as genuine user messages. They are execution metadata, not conversation, and
+# must never become durable personal memory. Keep this deliberately anchored:
+# a human discussing one of these strings mid-message is still valid input.
+_INTERNAL_GATEWAY_TURN_RE = re.compile(
+    r"^\s*(?:"
+    r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
+    r"\[CONTEXT COMPACTION[^\]]*\]|"
+    r"\[CONTEXT SUMMARY\]:?|"
+    r"\[PRIOR CONTEXT[^\]]*\]|"
+    r"\[Your active task list was preserved across context compression\]|"
+    r"\[IMPORTANT: Background process \d+ matched watch pattern[^\n]*|"
+    r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
+    r"A background subagent you dispatched earlier has finished\."
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_internal_gateway_turn(text: str) -> bool:
+    """Return True for machine-generated gateway/delegation notifications."""
+    return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +252,185 @@ CONCLUDE_SCHEMA = {
 }
 
 
-ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
+
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Knowledge Graph tool schemas + helpers (RapidWebs KG overlay).
+# These expose the honcho fork's Knowledge Graph side-by-side with the existing
+# honcho_* memory tools. Each tool wraps a fork KG REST endpoint.
+# ---------------------------------------------------------------------------
+import urllib.parse
+
+_KG_ENTITY_TYPE_ENUM = [
+    "person", "agent", "service", "tool", "project", "concept", "location",
+    "organization", "event", "database", "server", "system", "technology",
+    "framework", "platform", "library", "protocol", "network", "file",
+    "config", "data", "api", "command", "unknown",
+]
+
+
+def _kg_base_url(cfg) -> str:
+    url = (getattr(cfg, "base_url", None) or "").strip().rstrip("/")
+    host = (getattr(cfg, "host", None) or "").strip().rstrip("/")
+    return (url or host or "http://127.0.0.1:8000")
+
+
+def _kg_workspace(cfg) -> str:
+    ws = getattr(cfg, "workspace_id", None) or "hermes"
+    return ws if ws and ws != "default" else "hermes"
+
+
+def _kg_request(plugin, path: str, params: dict, method: str = "GET") -> dict:
+    """Perform a request to the honcho KG REST endpoint."""
+    import urllib.request
+
+    base = _kg_base_url(plugin._config)
+    ws = _kg_workspace(plugin._config)
+    qs = urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v is not None and v != ""}
+    )
+    url = f"{base}/v3/workspaces/{urllib.parse.quote(ws)}/kg{path}"
+    if qs:
+        url = f"{url}?{qs}"
+    req = urllib.request.Request(url, method=method, headers={"Accept": "application/json"})
+    api_key = getattr(plugin._config, "api_key", None)
+    if api_key and api_key not in (None, "", "local"):
+        req.add_header("Authorization", f"Bearer {api_key}")
+    timeout = 300 if method == "POST" else 45
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+KG_ENTITY_SEARCH_SCHEMA = {
+    "name": "kg_entity_search",
+    "description": (
+        "Search the RapidWebs knowledge graph for entities by name or alias "
+        "(substring/ILIKE). Use to discover what entities exist before traversing "
+        "or reasoning about connections. Returns entity name, type, aliases, "
+        "confidence, mention count. Related: kg_traverse, kg_query, honcho_search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string", "description": "Entity name or alias substring to search (min 1 char)."},
+            "entity_type": {"type": "string", "enum": _KG_ENTITY_TYPE_ENUM, "description": "Filter by entity type."},
+            "min_confidence": {"type": "number", "description": "Minimum confidence (0-1). Default 0."},
+            "limit": {"type": "integer", "description": "Max results. Default 20, max 100."},
+            "include_dormant": {"type": "boolean", "description": "Include dormant/stale entities. Default false."},
+        },
+        "required": ["q"],
+    },
+}
+
+KG_PEER_ENTITIES_SCHEMA = {
+    "name": "kg_peer_entities",
+    "description": (
+        "Get entities linked to a specific peer in the knowledge graph. Use to see "
+        "what entities a peer is associated with across sessions. Returns entity "
+        "name, type, relationship, confidence. Related: honcho_profile."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "peer_name": {"type": "string", "description": "Peer name (e.g. 'sysop', 'hermes')."},
+            "relationship_types": {"type": "string", "description": "Comma-separated relationship type filter (e.g. 'manages,operates')."},
+            "limit": {"type": "integer", "description": "Max results. Default 50, max 200."},
+        },
+        "required": ["peer_name"],
+    },
+}
+
+KG_TRAVERSE_SCHEMA = {
+    "name": "kg_traverse",
+    "description": (
+        "BFS traversal through the knowledge graph from a starting entity. Use for "
+        "multi-hop graph reasoning: find what an entity connects to and at what "
+        "depth (services, people, systems). Depth clamped to <=6. "
+        "Related: kg_entity_search, kg_subgraph, kg_query."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Starting entity name."},
+            "max_depth": {"type": "integer", "description": "Max traversal depth. Default 2, clamp <=6."},
+            "relationship_types": {"type": "string", "description": "Comma-separated relationship type filter."},
+            "entity_types": {"type": "string", "description": "Comma-separated entity type filter."},
+            "min_confidence": {"type": "number", "description": "Minimum confidence (0-1). Default 0."},
+            "limit": {"type": "integer", "description": "Max results. Default 100, max 200."},
+        },
+        "required": ["entity"],
+    },
+}
+
+KG_SUBGRAPH_SCHEMA = {
+    "name": "kg_subgraph",
+    "description": (
+        "Extract the neighborhood subgraph around a given entity. Pull the graph "
+        "neighborhood for context injection. Depth clamped to <=3. Returns entities "
+        "and relationships near the center. Related: kg_traverse."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Center entity name."},
+            "depth": {"type": "integer", "description": "Neighborhood depth. Default 1, clamp <=3."},
+            "limit": {"type": "integer", "description": "Max results. Default 100, max 200."},
+        },
+        "required": ["entity"],
+    },
+}
+
+KG_QUERY_SCHEMA = {
+    "name": "kg_query",
+    "description": (
+        "Find a path between two entities in the knowledge graph. Use to determine "
+        "how two entities are connected (e.g. 'how does honcho-db relate to "
+        "postgres-rwdn?'). Returns the shortest relationship path. Related: kg_traverse."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "from": {"type": "string", "description": "Starting (source) entity name."},
+            "to": {"type": "string", "description": "Target entity name."},
+            "max_depth": {"type": "integer", "description": "Max path depth. Default 5, max 10."},
+        },
+        "required": ["from", "to"],
+    },
+}
+
+KG_AUTO_EXTRACT_SCHEMA = {
+    "name": "kg_auto_extract",
+    "description": (
+        "Populate the knowledge graph by running entity/relationship extraction over "
+        "recent workspace messages. Build or fill the graph from conversation "
+        "history. Triggers LLM extraction on up to `limit` recent messages, then "
+        "auto-links person/agent entities to peers. Can be slow (LLM per message). "
+        "Related: kg_entity_search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Number of recent messages to process. Default 20, max 200."},
+            "min_content_length": {"type": "integer", "description": "Minimum message content length to consider. Default 40."},
+        },
+        "required": [],
+    },
+}
+
+KG_SCHEMAS = [
+    KG_ENTITY_SEARCH_SCHEMA,
+    KG_PEER_ENTITIES_SCHEMA,
+    KG_TRAVERSE_SCHEMA,
+    KG_SUBGRAPH_SCHEMA,
+    KG_QUERY_SCHEMA,
+    KG_AUTO_EXTRACT_SCHEMA,
+]
+
+ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA] + KG_SCHEMAS
+
+
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -291,6 +491,10 @@ class HonchoMemoryProvider(MemoryProvider):
         self._init_thread: Optional[threading.Thread] = None
         self._init_lock = threading.Lock()
         self._init_error = ""
+
+        # Init auth failures live here because the failed manager is discarded.
+        self._init_auth_failure: Optional[str] = None
+        self._init_auth_notice_emitted = False
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
@@ -445,19 +649,26 @@ class HonchoMemoryProvider(MemoryProvider):
             init_session_id = self._lazy_init_session_id or "hermes-default"
 
             def _run() -> None:
+                from plugins.memory.honcho.session import HonchoAuthError
+
                 try:
                     self._do_session_init(cfg, init_session_id, **init_kwargs)
                     self._lazy_init_kwargs = None
                     self._lazy_init_session_id = None
                     self._init_error = ""
+                    self._clear_init_auth_failure()
+                except HonchoAuthError as e:
+                    self._init_error = str(e)
+                    self._record_init_auth_failure(e)
+                    self._manager = None
+                    logger.warning("Honcho background session init failed: authentication rejected")
                 except Exception as e:
                     self._init_error = str(e)
                     self._manager = None
                     logger.warning("Honcho background session init failed: %s", e)
 
-            self._init_thread = threading.Thread(
-                target=_run,
-                daemon=True,
+            self._init_thread = spawn_context_thread(
+                _run,
                 name="honcho-session-init",
             )
             self._init_thread.start()
@@ -522,7 +733,7 @@ class HonchoMemoryProvider(MemoryProvider):
                         )
                     except Exception as exc:
                         logger.debug("Honcho dialectic prewarm failed: %s", exc)
-                        self._dialectic_empty_streak += 1
+                        self._note_dialectic_failure(exc)
                         return
                     if r and r.strip():
                         with self._prefetch_lock:
@@ -534,9 +745,8 @@ class HonchoMemoryProvider(MemoryProvider):
                         self._dialectic_empty_streak += 1
 
                 self._prefetch_thread_started_at = time.monotonic()
-                prewarm_thread = threading.Thread(
-                    target=_prewarm_dialectic,
-                    daemon=True,
+                prewarm_thread = spawn_context_thread(
+                    _prewarm_dialectic,
                     name="honcho-prewarm-dialectic",
                 )
                 prewarm_thread.start()
@@ -563,6 +773,8 @@ class HonchoMemoryProvider(MemoryProvider):
         if not self._config or self._lazy_init_kwargs is None:
             return False
 
+        from plugins.memory.honcho.session import HonchoAuthError
+
         try:
             self._do_session_init(
                 self._config,
@@ -572,12 +784,28 @@ class HonchoMemoryProvider(MemoryProvider):
             # Clear lazy refs
             self._lazy_init_kwargs = None
             self._lazy_init_session_id = None
+            self._clear_init_auth_failure()
             return self._manager is not None
+        except HonchoAuthError as e:
+            self._record_init_auth_failure(e)
+            self._manager = None
+            self._session_initialized = False
+            logger.warning("Honcho lazy session init failed: authentication rejected")
+            return False
         except Exception as e:
             self._manager = None
             self._session_initialized = False
             logger.warning("Honcho lazy session init failed: %s", e)
             return False
+
+    def _record_init_auth_failure(self, exc: BaseException) -> None:
+        """Keep the auth detail so the one-time notice survives the manager discard."""
+        self._init_auth_failure = str(exc)
+
+    def _clear_init_auth_failure(self) -> None:
+        if self._init_auth_failure is not None:
+            self._init_auth_failure = None
+            self._init_auth_notice_emitted = False
 
     def _session_ready(self) -> bool:
         """Return whether a manager/session key can be used safely.
@@ -701,7 +929,8 @@ class HonchoMemoryProvider(MemoryProvider):
                         timeout=max(0.0, first_turn_base_deadline - time.monotonic())
                     )
             if not self._session_ready():
-                return ""
+                # A failed auth init still owes the user the one-time notice.
+                return self._pop_auth_notice()
 
         # First-turn mode suppresses only the base layer; dialectic is independent.
         _skip_base = (
@@ -714,6 +943,11 @@ class HonchoMemoryProvider(MemoryProvider):
             return self._truncate_to_budget(ready) if ready else ""
 
         parts = []
+
+        # One-time notice, relayed by the model, that auth is dead and memory is paused.
+        auth_notice = self._pop_auth_notice()
+        if auth_notice:
+            parts.append(auth_notice)
 
         # ----- Layer 1: Base context (representation + card) -----
         if not _skip_base:
@@ -740,9 +974,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     except Exception as e:
                         logger.debug("Honcho first-turn base context failed: %s", e)
 
-                _bt = threading.Thread(
-                    target=_fetch_base, daemon=True, name="honcho-base-first"
-                )
+                _bt = spawn_context_thread(_fetch_base, name="honcho-base-first")
                 _bt.start()
                 _base_wait = (
                     max(0.0, first_turn_base_deadline - time.monotonic())
@@ -804,7 +1036,7 @@ class HonchoMemoryProvider(MemoryProvider):
                         r = self._run_dialectic_depth(query)
                     except Exception as exc:
                         logger.debug("Honcho first-turn dialectic failed: %s", exc)
-                        self._dialectic_empty_streak += 1
+                        self._note_dialectic_failure(exc)
                         return
                     if r and r.strip():
                         with self._prefetch_lock:
@@ -817,8 +1049,8 @@ class HonchoMemoryProvider(MemoryProvider):
                         self._dialectic_empty_streak += 1
 
                 self._prefetch_thread_started_at = time.monotonic()
-                first_turn_thread = threading.Thread(
-                    target=_run_first_turn, daemon=True, name="honcho-prefetch-first"
+                first_turn_thread = spawn_context_thread(
+                    _run_first_turn, name="honcho-prefetch-first"
                 )
                 first_turn_thread.start()
                 self._prefetch_thread = first_turn_thread
@@ -844,6 +1076,26 @@ class HonchoMemoryProvider(MemoryProvider):
         result = self._truncate_to_budget(result)
 
         return result
+
+    def _pop_auth_notice(self) -> str:
+        """One-time model-facing notice that Honcho auth expired and memory is paused."""
+        # getattr (not a direct call): test fakes install minimal managers
+        # without pop_auth_notice; exceptions still propagate.
+        pop = getattr(self._manager, "pop_auth_notice", None)
+        msg = pop() if callable(pop) else None
+        if not isinstance(msg, str) or not msg:
+            # Init failures discard the manager; the provider kept the detail.
+            if self._init_auth_failure is None or self._init_auth_notice_emitted:
+                return ""
+            self._init_auth_notice_emitted = True
+            msg = self._init_auth_failure
+        return (
+            "[Honcho memory status] Authentication with the Honcho memory backend "
+            "has expired and automatic token refresh failed, so memory sync and "
+            f"recall are paused. Reason: {msg}\n"
+            "Tell the user (once) that Honcho memory is paused and that running "
+            "'hermes honcho setup' to re-authenticate will restore it."
+        )
 
     def _consume_pending_dialectic(self) -> str:
         """Pop any pending dialectic result, applying the stale-discard guard.
@@ -941,7 +1193,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 result = self._run_dialectic_depth(query)
             except Exception as e:
                 logger.debug("Honcho prefetch failed: %s", e)
-                self._dialectic_empty_streak += 1
+                self._note_dialectic_failure(e)
                 return
             if result and result.strip():
                 with self._prefetch_lock:
@@ -953,9 +1205,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._dialectic_empty_streak += 1
 
         self._prefetch_thread_started_at = time.monotonic()
-        prefetch_thread = threading.Thread(
-            target=_run, daemon=True, name="honcho-prefetch"
-        )
+        prefetch_thread = spawn_context_thread(_run, name="honcho-prefetch")
         prefetch_thread.start()
         self._prefetch_thread = prefetch_thread
 
@@ -1019,6 +1269,21 @@ class HonchoMemoryProvider(MemoryProvider):
         widened = self._dialectic_cadence + self._dialectic_empty_streak
         ceiling = self._dialectic_cadence * self._BACKOFF_MAX
         return min(widened, ceiling)
+
+    def _note_dialectic_failure(self, exc: BaseException) -> None:
+        """Widen the empty-streak backoff after a failed dialectic cycle.
+
+        Auth failures are exempt because waiting cannot fix a dead token.
+        """
+        from plugins.memory.honcho.session import HonchoAuthError
+
+        if isinstance(exc, HonchoAuthError):
+            logger.warning(
+                "Honcho dialectic auth failure (not counted toward cadence backoff): %s",
+                exc,
+            )
+            return
+        self._dialectic_empty_streak += 1
 
     def liveness_snapshot(self) -> dict:
         """In-process snapshot of dialectic liveness state for diagnostics.
@@ -1196,28 +1461,17 @@ class HonchoMemoryProvider(MemoryProvider):
                 return r
         return ""
 
-    # Prompts that carry no semantic signal — trivial acknowledgements, slash
-    # commands, empty input. Skipping injection here saves tokens and prevents
-    # stale user-model context from derailing one-word replies.
-    _TRIVIAL_PROMPT_RE = re.compile(
-        r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
-        r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)$',
-        re.IGNORECASE,
-    )
+    # Prompts that carry no semantic signal — trivial acknowledgements, greetings,
+    # slash commands, empty input. Skipping injection here saves tokens and prevents
+    # stale user-model context from derailing one-word replies. Classification is
+    # fully delegated to the shared agent/memory_provider.is_trivial_prompt so the
+    # provider-side classifier and the core prefetch gate can never drift apart.
+    _TRIVIAL_PROMPT_RE = TRIVIAL_PROMPT_RE
 
     @classmethod
     def _is_trivial_prompt(cls, text: str) -> bool:
         """Return True if the prompt is too trivial to warrant context injection."""
-        if not text:
-            return True
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if stripped.startswith("/"):
-            return True
-        if cls._TRIVIAL_PROMPT_RE.match(stripped):
-            return True
-        return False
+        return is_trivial_prompt(text)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""
@@ -1330,8 +1584,19 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Messages exceeding the Honcho API limit (default 25k chars) are
         split into multiple messages with continuation markers.
+
+        Honors saveMessages: false — the provider then never persists raw
+        turns to Honcho (read/tools paths stay fully functional).
         """
         if self._cron_skipped:
+            return
+        # ``saveMessages`` is the operator's hard write gate. Previously it
+        # was parsed into HonchoClientConfig but never enforced here, so a
+        # cached hybrid provider kept writing even after containment was set.
+        if self._config and not getattr(self._config, "save_messages", True):
+            return
+        if _is_internal_gateway_turn(user_content):
+            logger.debug("Honcho sync skipped machine-generated gateway turn")
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return
@@ -1342,23 +1607,33 @@ class HonchoMemoryProvider(MemoryProvider):
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        # Skip only when the whole turn is empty. An interrupted or tool-only
+        # turn can legitimately have an empty assistant side; the user's
+        # message must still be persisted (the manager already drops
+        # empty-user turns upstream). Empty sides are skipped per-loop below
+        # so we never write empty-string messages either.
+        if not clean_user_content and not clean_assistant_content:
+            return
 
         def _sync():
             try:
                 session = self._manager.get_or_create(self._session_key)
-                for chunk in self._chunk_message(clean_user_content, msg_limit):
-                    session.add_message("user", chunk)
-                for chunk in self._chunk_message(clean_assistant_content, msg_limit):
-                    session.add_message("assistant", chunk)
-                self._manager._flush_session(session)
+                if clean_user_content:
+                    for chunk in self._chunk_message(clean_user_content, msg_limit):
+                        session.add_message("user", chunk)
+                if clean_assistant_content:
+                    for chunk in self._chunk_message(clean_assistant_content, msg_limit):
+                        session.add_message("assistant", chunk)
+                # Route through save() so writeFrequency is honored —
+                # _flush_session() directly bypassed "session"/N batching
+                # and flushed every turn regardless of config.
+                self._manager.save(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
-        self._sync_thread = threading.Thread(
-            target=_sync, daemon=True, name="honcho-sync"
-        )
+        self._sync_thread = spawn_context_thread(_sync, name="honcho-sync")
         self._sync_thread.start()
 
     def on_memory_write(
@@ -1379,6 +1654,11 @@ class HonchoMemoryProvider(MemoryProvider):
             return
         if self._cron_skipped:
             return
+        # ``saveMessages`` is the operator's hard write gate; the memory-tool
+        # mirror is an automatic Honcho mutation path and must respect it too,
+        # otherwise containment would only cover conversation turns.
+        if self._config and not getattr(self._config, "save_messages", True):
+            return
         if self._recall_mode == "tools" and not self._session_ready():
             return
         if not self._session_ready():
@@ -1391,12 +1671,14 @@ class HonchoMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
 
-        t = threading.Thread(target=_write, daemon=True, name="honcho-memwrite")
-        t.start()
+        self._memwrite_thread = spawn_context_thread(_write, name="honcho-memwrite")
+        self._memwrite_thread.start()
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
         if self._cron_skipped:
+            return
+        if not getattr(self._config, "save_messages", True):
             return
         if not self._manager:
             return
@@ -1423,6 +1705,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         """Handle a Honcho tool call, with lazy session init for tools-only mode."""
+        from plugins.memory.honcho.session import HonchoAuthError
+
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
 
@@ -1430,6 +1714,10 @@ class HonchoMemoryProvider(MemoryProvider):
             if self._init_thread and self._init_thread.is_alive():
                 return tool_error("Honcho session is still initializing; try again shortly.")
             if not self._ensure_session():
+                if self._init_auth_failure:
+                    return tool_error(
+                        f"Honcho memory authentication failed: {self._init_auth_failure}"
+                    )
                 return tool_error("Honcho session could not be initialized.")
 
         if not self._manager or not self._session_key:
@@ -1468,13 +1756,31 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error("Missing required parameter: query")
                 peer = args.get("peer", "user")
                 reasoning_level = args.get("reasoning_level")
-                result = self._manager.dialectic_query(
-                    self._session_key, query,
-                    reasoning_level=reasoning_level,
-                    peer=peer,
-                    # Explicit reasoning bypasses the automatic-injection cap.
-                    apply_injection_cap=False,
-                )
+                try:
+                    result = self._manager.dialectic_query(
+                        self._session_key, query,
+                        reasoning_level=reasoning_level,
+                        peer=peer,
+                        # Explicit reasoning bypasses the automatic-injection cap.
+                        apply_injection_cap=False,
+                        # Explicit tool call: surface timeouts/server errors as
+                        # errors instead of collapsing them into "no result",
+                        # which is indistinguishable from an empty answer.
+                        raise_errors=True,
+                    )
+                except HonchoAuthError:
+                    # Let the outer dispatch's auth-specific handler render this.
+                    raise
+                except Exception as e:
+                    logger.warning("honcho_reasoning failed: %s", e)
+                    return tool_error(
+                        f"Honcho reasoning query failed ({e}). This is a backend "
+                        "error, not an empty result — the peer may still have "
+                        "relevant context. Slow dialectic calls at higher "
+                        "reasoning levels can exceed the configured timeout; "
+                        "consider a lower reasoning_level or raising the "
+                        "'timeout' value in honcho.json."
+                    )
                 # Update cadence tracker so auto-injection respects the gap after an explicit call
                 self._last_dialectic_turn = self._turn_count
                 return json.dumps({"result": result or "No result from Honcho."})
@@ -1530,20 +1836,117 @@ class HonchoMemoryProvider(MemoryProvider):
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
                 return tool_error("Failed to save conclusion.")
 
+            elif tool_name == "kg_entity_search":
+                try:
+                    data = _kg_request(self, "/entities", {
+                        "q": (args.get("q") or "").strip(),
+                        "entity_type": args.get("entity_type"),
+                        "min_confidence": args.get("min_confidence"),
+                        "limit": args.get("limit"),
+                        "include_dormant": args.get("include_dormant"),
+                    })
+                    entities = data.get("entities", [])
+                    return json.dumps({"result": entities, "total": data.get("total", len(entities))})
+                except Exception as _e:
+                    logger.warning("kg_entity_search failed: %s", _e)
+                    return tool_error("kg_entity_search failed: %s" % _e)
+
+            elif tool_name == "kg_peer_entities":
+                try:
+                    data = _kg_request(self, "/peer-entities", {
+                        "peer_name": (args.get("peer_name") or "").strip(),
+                        "relationship_types": args.get("relationship_types"),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data.get("entities", [])})
+                except Exception as _e:
+                    logger.warning("kg_peer_entities failed: %s", _e)
+                    return tool_error("kg_peer_entities failed: %s" % _e)
+
+            elif tool_name == "kg_traverse":
+                try:
+                    data = _kg_request(self, "/traverse", {
+                        "entity": (args.get("entity") or "").strip(),
+                        "max_depth": min(int(args.get("max_depth", 2) or 2), 6),
+                        "relationship_types": args.get("relationship_types"),
+                        "entity_types": args.get("entity_types"),
+                        "min_confidence": args.get("min_confidence"),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data.get("results", [])})
+                except Exception as _e:
+                    logger.warning("kg_traverse failed: %s", _e)
+                    return tool_error("kg_traverse failed: %s" % _e)
+
+            elif tool_name == "kg_subgraph":
+                try:
+                    data = _kg_request(self, "/subgraph", {
+                        "entity": (args.get("entity") or "").strip(),
+                        "depth": min(int(args.get("depth", 1) or 1), 3),
+                        "limit": args.get("limit"),
+                    })
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_subgraph failed: %s", _e)
+                    return tool_error("kg_subgraph failed: %s" % _e)
+
+            elif tool_name == "kg_query":
+                try:
+                    data = _kg_request(self, "/path", {
+                        "from": (args.get("from") or "").strip(),
+                        "to": (args.get("to") or "").strip(),
+                        "max_depth": args.get("max_depth"),
+                    })
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_query failed: %s", _e)
+                    return tool_error("kg_query failed: %s" % _e)
+
+            elif tool_name == "kg_auto_extract":
+                try:
+                    data = _kg_request(self, "/extract", {
+                        "limit": args.get("limit"),
+                        "min_content_length": args.get("min_content_length"),
+                    }, method="POST")
+                    return json.dumps({"result": data})
+                except Exception as _e:
+                    logger.warning("kg_auto_extract failed: %s", _e)
+                    return tool_error("kg_auto_extract failed: %s" % _e)
+
             return tool_error(f"Unknown tool: {tool_name}")
 
+        except HonchoAuthError as e:
+            # Never report an auth failure as an empty result; the model would read it as "no memory".
+            logger.error("Honcho tool %s failed: authentication rejected", tool_name)
+            return tool_error(f"Honcho memory authentication failed: {e}")
         except Exception as e:
             logger.error("Honcho tool %s failed: %s", tool_name, e)
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
-        for t in (self._prefetch_thread, self._sync_thread):
+        for t in (self._prefetch_thread, self._sync_thread, getattr(self, "_memwrite_thread", None)):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        # Flush any remaining messages
-        if self._manager and not (self._init_thread and self._init_thread.is_alive() and not self._session_initialized):
+        manager = self._manager
+        if manager and self._init_thread and self._init_thread.is_alive() and not self._session_initialized:
+            manager = None
+        # Honors saveMessages: false — skip persistence, but thread cleanup
+        # still runs: the session manager's async-writer thread must be
+        # joined either way so daemon threads aren't left blocked in httpx
+        # I/O during interpreter finalization.
+        if not getattr(self._config, "save_messages", True):
+            if manager:
+                try:
+                    manager.stop_async_writer()
+                except Exception:
+                    pass
+            return
+        if manager:
             try:
-                self._manager.flush_all()
+                # manager.shutdown() = flush_all() + join the async-writer
+                # thread. Previously only flush_all() ran here, leaving the
+                # writer thread alive at exit.
+                manager.shutdown()
             except Exception:
                 pass
 

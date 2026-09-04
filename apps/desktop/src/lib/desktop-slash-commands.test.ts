@@ -10,6 +10,7 @@ import {
   isDesktopSlashSuggestion,
   isModelPickerCommand,
   isPickerCommand,
+  rankSkillCommands,
   resolveDesktopCommand
 } from './desktop-slash-commands'
 
@@ -44,6 +45,18 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
 
+  it('/voice points at the composer voice button instead of the generic advanced message', () => {
+    // /voice arms server-side capture — on the desktop the composer's own
+    // voice conversation (mic menu / Ctrl+B) is the surface. A user typing
+    // /voice must be told where the button IS, not shrugged at.
+    expect(resolveDesktopCommand('/voice')?.surface).toEqual({ kind: 'unavailable', reason: 'composer-voice' })
+    expect(isDesktopSlashCommand('/voice')).toBe(false)
+
+    const message = desktopSlashUnavailableMessage('/voice')
+    expect(message).toContain('microphone button')
+    expect(message).toContain('Ctrl+B')
+  })
+
   it('routes /compact to /compress (context compression), not the TUI display toggle', () => {
     expect(resolveDesktopCommand('/compact')?.name).toBe('/compress')
     expect(isDesktopSlashCommand('/compact')).toBe(true)
@@ -72,6 +85,14 @@ describe('desktop slash command curation', () => {
     expect(resolveDesktopCommand('/pets')?.surface).toEqual({ kind: 'unavailable', reason: 'settings' })
     expect(isDesktopSlashSuggestion('/pets')).toBe(false)
     expect(isDesktopSlashCommand('/pets')).toBe(false)
+  })
+
+  it('routes /wake through the desktop wake action instead of the slash worker', () => {
+    expect(resolveDesktopCommand('/wake')?.surface).toEqual({ kind: 'action', action: 'wake' })
+    expect(desktopSlashCommandArgumentMode('/wake')).toBe('options')
+    expect(isDesktopSlashSuggestion('/wake')).toBe(true)
+    expect(isDesktopSlashCommand('/wake')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/wake')).toBeNull()
   })
 
   it('treats /browser as an executable action command (local-gateway connect)', () => {
@@ -290,5 +311,58 @@ describe('desktop slash command curation', () => {
     expect(resolveDesktopCommand('/clear')?.surface).toEqual({ kind: 'unavailable', reason: 'terminal' })
     // Skill / quick commands aren't in the registry.
     expect(resolveDesktopCommand('/gif-search')).toBeNull()
+  })
+})
+
+describe('rankSkillCommands', () => {
+  const rows = [
+    { text: '/research' },
+    { text: '/research-paper-writing' },
+    { text: '/work' },
+    { text: '/ship-it' },
+    { text: '/manim-video' },
+    { text: '/docx' }
+  ]
+
+  const skills = {
+    '/research': { usage: 60, origin: 'local' as const },
+    '/research-paper-writing': { usage: 0, origin: 'bundled' as const },
+    '/work': { usage: 172, origin: 'local' as const },
+    '/manim-video': { usage: 0, origin: 'bundled' as const },
+    '/docx': { usage: 0, origin: 'local' as const }
+  }
+
+  it('puts the most-used skill first and breaks ties alphabetically', () => {
+    expect(rankSkillCommands(rows, skills).map(row => row.text)).toEqual([
+      '/work',
+      '/research',
+      '/docx',
+      '/manim-video',
+      '/research-paper-writing',
+      '/ship-it'
+    ])
+  })
+
+  it('drops never-used built-ins when browsing, keeping everything else', () => {
+    const browsing = rankSkillCommands(rows, skills, { pruneUnusedBuiltins: true }).map(row => row.text)
+
+    expect(browsing).toEqual(['/work', '/research', '/docx', '/ship-it'])
+    // A user's own unused skill survives — only shipped-and-ignored goes.
+    expect(browsing).toContain('/docx')
+    // Unclassified rows (quick commands, skills newer than the map) survive too.
+    expect(browsing).toContain('/ship-it')
+  })
+
+  it('leaves the backend order untouched when the catalog carries no usage', () => {
+    expect(rankSkillCommands(rows, undefined, { pruneUnusedBuiltins: true })).toEqual(rows)
+  })
+
+  it('ranks an alias by the canonical command it resolves to', () => {
+    const ranked = rankSkillCommands([{ text: '/sessions' }, { text: '/research' }], {
+      '/research': { usage: 5, origin: 'local' },
+      '/resume': { usage: 900, origin: 'local' }
+    })
+
+    expect(ranked.map(row => row.text)).toEqual(['/sessions', '/research'])
   })
 })

@@ -7,8 +7,23 @@ export interface CommandsCatalogLike {
   categories?: CommandsCatalogSection[]
   pairs?: [string, string][]
   skill_count?: number
+  skills?: SkillCatalogMap
   warning?: string
 }
+
+/**
+ * Per-skill ranking data from `commands.catalog`, keyed by slash command.
+ * Absent on older backends — every helper below degrades to "no ranking,
+ * hide nothing".
+ */
+export interface SkillCatalogEntry {
+  /** Where the skill came from; matches `/api/skills` provenance ('agent' = 'local'). */
+  origin?: 'bundled' | 'hub' | 'local'
+  /** Observed activity (use + view + patch) — the same number Capabilities shows. */
+  usage?: number
+}
+
+export type SkillCatalogMap = Record<string, SkillCatalogEntry>
 
 export interface DesktopSlashCompletion {
   display: string
@@ -41,13 +56,14 @@ export type DesktopActionId =
   | 'profile'
   | 'skin'
   | 'title'
+  | 'wake'
   | 'yolo'
 
 /** A command fulfilled by opening a desktop overlay picker. */
 export type DesktopPickerId = 'model' | 'session'
 
 /** Why a known Hermes command has no desktop UI surface. */
-export type DesktopUnavailableReason = 'advanced' | 'messaging' | 'settings' | 'terminal'
+export type DesktopUnavailableReason = 'advanced' | 'composer-voice' | 'messaging' | 'settings' | 'terminal'
 
 /**
  * How the desktop fulfils a command. This is the single discriminator the
@@ -154,6 +170,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   },
   { name: '/yolo', description: 'Toggle YOLO — auto-approve dangerous commands', surface: action('yolo') },
   {
+    name: '/wake',
+    description: 'Control the desktop wake-word listener [on|off|status]',
+    surface: action('wake'),
+    argumentMode: 'options'
+  },
+  {
     name: '/handoff',
     description: 'Hand off this session to a messaging platform',
     surface: action('handoff'),
@@ -241,6 +263,13 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   {
     name: '/goal',
     description: 'Manage the standing goal for this session',
+    surface: exec(),
+    argumentMode: 'mixed'
+  },
+  {
+    name: '/loop',
+    description: 'Re-run a prompt on a recurring interval in this session',
+    aliases: ['/proactive'],
     surface: exec(),
     argumentMode: 'mixed'
   },
@@ -341,7 +370,12 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
   ],
   messaging: ['/approve', '/deny'],
   settings: ['/skills', '/pets'],
-  advanced: ['/curator', '/fast', '/insights', '/kanban', '/reasoning', '/voice']
+  advanced: ['/curator', '/fast', '/insights', '/kanban', '/reasoning'],
+  // /voice arms SERVER-side capture (voice.record → PortAudio on the backend
+  // host) — meaningless on desktop, which has its own composer-native voice
+  // conversation (mic menu / Ctrl+B) with client-side capture and playback.
+  // Point the user at the button instead of a generic "advanced" shrug.
+  'composer-voice': ['/voice']
 }
 
 const ALL_SPECS: readonly DesktopCommandSpec[] = [
@@ -360,6 +394,8 @@ const ALIAS_TO_CANONICAL = new Map<string, string>(
 const UNAVAILABLE_MESSAGE: Record<DesktopUnavailableReason, (command: string) => string> = {
   advanced: command =>
     `${command} is not shown in the desktop slash palette. Use the relevant desktop control or terminal interface instead.`,
+  'composer-voice': () =>
+    'Voice chat lives in the composer here: click the microphone button and choose "Start voice chat" (or press Ctrl+B).',
   messaging: command => `${command} is only used from messaging platforms.`,
   settings: command => `${command} is managed from the desktop sidebar.`,
   terminal: command => `${command} is only available in the terminal interface.`
@@ -516,6 +552,43 @@ export function desktopSkinSlashCompletions(
   }
 
   return commands.filter(item => item.text.slice('/skin '.length).toLowerCase().startsWith(prefix))
+}
+
+/**
+ * Order skill rows by how much the user actually uses them, most-used first,
+ * A–Z within a tie. A `/` menu sorted alphabetically buries the handful of
+ * skills someone reaches for daily under a hundred they have never opened.
+ *
+ * `pruneUnusedBuiltins` additionally drops bundled skills with no recorded
+ * activity — the ones that ship with Hermes and were never asked for. It is
+ * for BROWSING (a bare `/`) only: typing a query is a search, and a search
+ * must never hide a match.
+ *
+ * Older backends send no `skills` map; then nothing is reordered or dropped.
+ */
+export function rankSkillCommands<T extends { text: string }>(
+  rows: readonly T[],
+  skills: SkillCatalogMap | undefined,
+  { pruneUnusedBuiltins = false }: { pruneUnusedBuiltins?: boolean } = {}
+): T[] {
+  if (!skills) {
+    return [...rows]
+  }
+
+  const entryOf = (row: T): SkillCatalogEntry | undefined => skills[canonicalDesktopSlashCommand(row.text)]
+  const usageOf = (row: T): number => entryOf(row)?.usage ?? 0
+
+  const kept = pruneUnusedBuiltins
+    ? rows.filter(row => {
+        const entry = entryOf(row)
+
+        // Unknown to the map (a quick command, a newer skill the catalog
+        // hasn't classified) stays — only a confirmed never-used built-in goes.
+        return !entry || entry.origin !== 'bundled' || (entry.usage ?? 0) > 0
+      })
+    : [...rows]
+
+  return kept.sort((a, b) => usageOf(b) - usageOf(a) || a.text.localeCompare(b.text))
 }
 
 export function filterDesktopCommandsCatalog(catalog: CommandsCatalogLike): CommandsCatalogLike {

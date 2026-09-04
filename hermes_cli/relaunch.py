@@ -99,18 +99,38 @@ def resolve_hermes_bin() -> Optional[str]:
     _is_windows = sys.platform == "win32"
 
     def _is_python_script(p: str) -> bool:
-        return p.lower().endswith((".py", ".pyc"))
+        """True when ``p`` is a Python source/entry-point that must be run by a
+        Python interpreter rather than exec'd directly.
+
+        Covers both explicit ``.py``/``.pyc`` filenames (the Windows case) and
+        *extension-less* launcher scripts whose shebang is ``env python3``/``python``
+        (the Linux/macOS case).  Returning one of these as the bare exec target is
+        unsafe: the OS resolves the ``env python`` shebang from PATH and can pick
+        the system interpreter instead of the venv that owns the running process.
+        Relaunching ``.../hermes-agent/hermes`` that way drops the venv and crashes
+        on imports only present in it (e.g. ``rich``).  Callers must instead fall
+        through to the ``hermes`` shim on PATH or the ``sys.executable -m
+        hermes_cli.main`` fallback, both of which use the correct interpreter.
+        """
+        if p.lower().endswith((".py", ".pyc")):
+            return True
+        try:
+            with open(p, "rb") as fh:
+                head = fh.readline(128).decode("ascii", "ignore").strip()
+        except OSError:
+            return False
+        return head.startswith("#!") and "python" in head
 
     # Absolute path to an executable (covers nix store, venv wrappers, etc.)
     if os.path.isabs(argv0) and os.path.isfile(argv0) and os.access(argv0, os.X_OK):
-        if not (_is_windows and _is_python_script(argv0)):
+        if not _is_python_script(argv0):
             return argv0
 
     # Relative path — resolve against CWD
     if not argv0.startswith("-") and os.path.isfile(argv0):
         abs_path = os.path.abspath(argv0)
         if os.access(abs_path, os.X_OK):
-            if not (_is_windows and _is_python_script(abs_path)):
+            if not _is_python_script(abs_path):
                 return abs_path
 
     # PATH lookup

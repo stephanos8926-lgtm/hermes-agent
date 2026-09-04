@@ -516,12 +516,17 @@ def _ensure_sdk_installed() -> bool:
         return False
 
     print("  Installing honcho-ai...", flush=True)
-    from hermes_cli.tools_config import _pip_install
+    # Environment-aware install: sealed hosted venvs redirect to the durable
+    # data-volume target instead of writing to /opt/hermes (NS-605).
+    from tools.lazy_deps import install_specs
 
-    result = _pip_install(["honcho-ai==2.2.0"])
-    if result.returncode == 0:
+    result = install_specs(["honcho-ai==2.2.0"])
+    if result.ok:
         print("  Installed.\n")
         return True
+    elif result.blocked:
+        print(f"  Cannot install: {result.reason}\n")
+        return False
     else:
         print(f"  Install failed:\n{(result.stderr or '').strip()}")
         print("  Run manually: uv pip install 'honcho-ai==2.2.0'\n")
@@ -961,7 +966,51 @@ def cmd_setup(args) -> None:
     except (ValueError, TypeError):
         hermes_host["dialecticCadence"] = 2
 
-    # --- 7c. Dialectic reasoning level ---
+    # --- 7c. KG context injection ---
+    current_kg_enabled = str(hermes_host.get("kgInjectEnabled") or cfg.get("kgInjectEnabled") or "false").lower()
+    print("\n  Knowledge Graph context injection:")
+    print("    Inject peer entities + relationships from the KG overlay into context.")
+    print("    Useful for multi-project workspaces where the AI needs project<->tool<->server links.")
+    new_kg_enabled = _prompt("Inject KG context? (yes/no)", default=current_kg_enabled)
+    hermes_host["kgInjectEnabled"] = new_kg_enabled in {"yes", "true", "1", "y"}
+
+    if hermes_host["kgInjectEnabled"]:
+        current_kg_cadence = str(hermes_host.get("kgInjectCadence") or cfg.get("kgInjectCadence") or "5")
+        print("\n  KG injection cadence:")
+        print("    How often to inject KG context (turns).")
+        print("    1 = every turn, 5 = every 5 turns, etc.")
+        new_kg_cadence = _prompt("KG inject cadence", default=current_kg_cadence)
+        try:
+            val = int(new_kg_cadence)
+            if val >= 1:
+                hermes_host["kgInjectCadence"] = val
+        except (ValueError, TypeError):
+            hermes_host["kgInjectCadence"] = 5
+
+        current_kg_entities = str(hermes_host.get("kgInjectMaxEntities") or cfg.get("kgInjectMaxEntities") or "15")
+        print("\n  KG max entities:")
+        print("    Maximum peer entities to include in the context dump.")
+        new_kg_entities = _prompt("KG max entities", default=current_kg_entities)
+        try:
+            val = int(new_kg_entities)
+            if val >= 1:
+                hermes_host["kgInjectMaxEntities"] = val
+        except (ValueError, TypeError):
+            hermes_host["kgInjectMaxEntities"] = 15
+
+        current_kg_depth = str(hermes_host.get("kgInjectMaxDepth") or cfg.get("kgInjectMaxDepth") or "1")
+        print("\n  KG max depth:")
+        print("    Neighborhood depth for each entity (0-3).")
+        print("    0 = entities only, 1 = entities + 1-hop neighbors, etc.")
+        new_kg_depth = _prompt("KG max depth", default=current_kg_depth)
+        try:
+            val = int(new_kg_depth)
+            if 0 <= val <= 3:
+                hermes_host["kgInjectMaxDepth"] = val
+        except (ValueError, TypeError):
+            hermes_host["kgInjectMaxDepth"] = 1
+
+    # --- 7d. Dialectic reasoning level ---
     current_reasoning = (
         hermes_host.get("dialecticReasoningLevel")
         or cfg.get("dialecticReasoningLevel")
@@ -1105,8 +1154,11 @@ def _all_profile_host_configs() -> list[tuple[str, str, dict]]:
     for p in profiles:
         if p.name == "default":
             continue
-        h = f"{HOST}.{p.name}"
-        results.append((p.name, h, hosts.get(h, {})))
+        h = profile_host_key(p.name)
+        # _host_block (not hosts.get) so legacy dot-form keys
+        # ("hermes.work") stay readable per the README's back-compat
+        # promise — the canonical key resolves first, legacy falls back.
+        results.append((p.name, h, _host_block(cfg, h)))
 
     return results
 
@@ -1536,8 +1588,15 @@ def cmd_identity(args) -> None:
         return
 
     if show:
+        from plugins.memory.honcho.session import HonchoAuthError
+        try:
+            user_card = mgr.get_peer_card(session_key)
+            ai_rep = mgr.get_ai_representation(session_key)
+        except HonchoAuthError as e:
+            print(f"  Honcho authentication failed: {e}\n")
+            return
+
         # ── User peer ────────────────────────────────────────────────────────
-        user_card = mgr.get_peer_card(session_key)
         print(f"\nUser peer ({hcfg.peer_name or 'not set'})\n" + "─" * 40)
         if user_card:
             for fact in user_card:
@@ -1546,7 +1605,6 @@ def cmd_identity(args) -> None:
             print("  No user peer card yet. Send a few messages to build one.")
 
         # ── AI peer ──────────────────────────────────────────────────────────
-        ai_rep = mgr.get_ai_representation(session_key)
         print(f"\nAI peer ({hcfg.ai_peer})\n" + "─" * 40)
         if ai_rep.get("representation"):
             print(ai_rep["representation"])

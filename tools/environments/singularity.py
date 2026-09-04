@@ -20,6 +20,7 @@ from tools.environments.base import (
     _load_json_store,
     _popen_bash,
     _save_json_store,
+    sanitize_task_id_for_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,7 +130,10 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
         tmp_dir = cache_dir / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        env = os.environ.copy()
+        # apptainer/singularity build: external tool, may need registry
+        # credentials from the user env — exact preservation.
+        from tools.environments.local import build_subprocess_env
+        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
         env["APPTAINER_TMPDIR"] = str(tmp_dir)
         env["APPTAINER_CACHEDIR"] = str(cache_dir)
 
@@ -188,7 +192,11 @@ class SingularityEnvironment(BaseEnvironment):
         if self._persistent:
             overlay_base = _get_scratch_dir() / "hermes-overlays"
             overlay_base.mkdir(parents=True, exist_ok=True)
-            self._overlay_dir = overlay_base / f"overlay-{task_id}"
+            # A raw session-key task_id carries colons and other characters
+            # that are unsafe in host path components (same class of bug as
+            # the docker -v mount failure); route it through the shared
+            # sanitizer so all backends agree on the mapping.
+            self._overlay_dir = overlay_base / f"overlay-{sanitize_task_id_for_path(task_id)}"
             self._overlay_dir.mkdir(parents=True, exist_ok=True)
 
         self._start_instance()

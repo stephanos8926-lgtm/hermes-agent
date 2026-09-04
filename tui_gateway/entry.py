@@ -376,19 +376,10 @@ _recovery_times: list[float] = []
 
 
 def _has_configured_mcp_servers() -> bool:
-    """Return whether startup should attempt MCP discovery.
+    """Delegate to the shared native and portable MCP startup gate."""
+    from hermes_cli.mcp_startup import _has_configured_mcp_servers as configured
 
-    Keep this cheap so non-MCP users do not pay the MCP SDK import cost.
-    """
-    try:
-        from hermes_cli.config import read_raw_config
-
-        mcp_servers = (read_raw_config() or {}).get("mcp_servers")
-        return isinstance(mcp_servers, dict) and len(mcp_servers) > 0
-    except Exception:
-        # Be conservative: if we can't decide, fall back to attempting
-        # discovery. The caller starts it in the background.
-        return True
+    return configured()
 
 
 def ensure_mcp_discovery_started() -> None:
@@ -430,6 +421,16 @@ def ensure_mcp_discovery_started() -> None:
 def main():
     _install_sidecar_publisher()
 
+    # One-time sweep of session rows orphaned by a previous gateway process
+    # (#65194) — the in-process WS-orphan reap timer dies with the process.
+    # Desktop/dashboard reach the agent through handle_ws instead; the
+    # scheduler is once-per-process + config-gated so the second site is a
+    # no-op when this already ran.
+    try:
+        server._schedule_startup_orphan_sweep()
+    except Exception:
+        logger.warning("startup orphan sweep scheduling failed", exc_info=True)
+
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
     # connect retries → ~7s of dead air before the composer appears).  The
@@ -443,13 +444,28 @@ def main():
     if not write_json({
         "jsonrpc": "2.0",
         "method": "event",
-        "params": {"type": "gateway.ready", "payload": {"skin": resolve_skin()}},
+        "params": {
+            "type": "gateway.ready",
+            # change_events: see tui_gateway/ws.py — clients demote legacy polls.
+            "payload": {"skin": resolve_skin(), "change_events": True},
+        },
     }):
         _log_exit("startup write failed (broken stdout pipe before first event)")
         sys.exit(0)
 
     # Live-apply skins Hermes activates mid-conversation.
     server._ensure_skin_watcher()
+
+    # Warm the /model picker's provider-models cache off-thread during this
+    # idle window (gateway.ready sent, user about to type). Mirrors the classic
+    # CLI run() loop — the stdio TUI otherwise never prewarms, so the first
+    # /model open blocks on serial /v1/models fetches. Fire-and-forget,
+    # guarded once-per-process, fully exception-isolated.
+    try:
+        from hermes_cli.model_switch import prewarm_picker_cache_async
+        prewarm_picker_cache_async()
+    except Exception:
+        logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
     while True:
         raw = sys.stdin.readline()
