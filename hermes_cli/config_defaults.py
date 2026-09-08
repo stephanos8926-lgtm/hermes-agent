@@ -3773,6 +3773,94 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Cache infrastructure — unified tiered cache layer (L1/L2/L3).
+    # All sizing, TTLs, backends, and feature gates live here.
+    # Environment variables prefixed with HERMES_CACHE_* override these values.
+    "cache": {
+        # Master feature gate. When false, the entire cache layer is disabled
+        # (returns a single-entry placeholder L1 that black-holes writes).
+        "enabled": True,
+        # L1 — in-process memory (InProcessLRUCache).
+        # Always enabled when master switch is on.
+        "l1": {
+            "enabled": True,
+            "max_entries": 64,
+            "max_bytes": 33554432,
+            "value_max_bytes": 33554432,
+        },
+        # L2 — cross-process/cross-restart persistence.
+        "l2": {
+            "enabled": False,
+            "backend": "flat_file",
+            "flat_file": {
+                "path": "~/.hermes/cache/l2.mmap",
+                "max_bytes": 67108864,
+                "read_only": False,
+            },
+            "redis": {
+                "url": "redis://localhost:6379",
+                "namespace": "hermes",
+                "ttl_seconds": 3600,
+            },
+        },
+        # L3 — cold, large-capacity, sharded directory.
+        "l3": {
+            "enabled": False,
+            "backend": "sharded_file",
+            "sharded_file": {
+                "root": "~/.hermes/cache/l3",
+                "ttl_days": 30,
+            },
+            "sqlite": {
+                "path": "~/.hermes/cache/l3.sqlite",
+                "ttl_seconds": 86400,
+                "vacuum_threshold": 1000,
+            },
+        },
+        # Namespace-scoped tiers (secrets, model_metadata, replay, etc.).
+        # Each namespace gets its own L1+L2 partition with independent sizing.
+        "namespaces": {
+            "replay": {
+                "l1_max_entries": 256,
+                "l1_max_bytes": 8388608,
+                "l2_enabled": True,
+                "l2_max_bytes": 16777216,
+            },
+            "model_catalog": {
+                "l1_max_entries": 128,
+                "l1_max_bytes": 16777216,
+                "l2_enabled": True,
+                "l2_max_bytes": 33554432,
+            },
+            "model_metadata": {
+                "l1_max_entries": 256,
+                "l1_max_bytes": 16777216,
+                "l2_enabled": True,
+                "l2_max_bytes": 16777216,
+            },
+            "secrets": {
+                "l1_max_entries": 1024,
+                "l1_max_bytes": 4194304,
+                "l2_enabled": True,
+                "l2_max_bytes": 4194304,
+            },
+        },
+        # Pressure/eviction side-car integration.
+        "pressure": {
+            "enabled": True,
+            "l1_high_water_mark": 0.85,
+            "l1_low_water_mark": 0.6,
+            "l2_high_water_mark": 0.9,
+            "l2_low_water_mark": 0.7,
+        },
+        # Observability/metrics.
+        "observe": {
+            "enabled": True,
+            "sample_rate": 1.0,
+            "log_interval_seconds": 60,
+        },
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 38,
 }

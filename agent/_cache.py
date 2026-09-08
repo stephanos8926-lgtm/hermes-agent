@@ -1592,3 +1592,26 @@ def build_cache_from_config() -> TieredCache:
         # interface without None-checks.
         tiers.append(InProcessLRUCache(max_entries=1, max_bytes=1024))
     return TieredCacheRouter(*tiers)
+
+
+# Module-level singleton for the tiered cache router.
+_router_singleton: Optional[TieredCache] = None
+_router_lock = threading.Lock()
+
+
+def get_cache_router() -> TieredCache:
+    """Return the process-wide tiered cache router singleton.
+
+    The router is built on first call from the current config via
+    :func:`build_cache_from_config`. Subsequent calls return the same
+    instance so that all consumers share the same tiered cache.
+
+    To force a rebuild after a config change, set
+    ``agent._cache._router_singleton = None`` before calling again.
+    """
+    global _router_singleton
+    if _router_singleton is None:
+        with _router_lock:
+            if _router_singleton is None:
+                _router_singleton = build_cache_from_config()
+    return _router_singleton
