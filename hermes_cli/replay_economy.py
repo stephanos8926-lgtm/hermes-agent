@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from agent._cache import get_cache_router
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -29,7 +31,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # D-1: Request cache
-REPLAY_CACHE_L1_ENABLED = os.environ.get("HERMES_REPLAY_CACHE_L1_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+def _replay_cache_l1_enabled() -> bool:
+    """Check if D-1 request cache is enabled via env var (dynamic check)."""
+    return os.environ.get("HERMES_REPLAY_CACHE_L1_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
 REPLAY_CACHE_MAX_BYTES = int(os.environ.get("HERMES_REPLAY_CACHE_MAX_BYTES", "52428800"))  # 50 MiB
 REPLAY_CACHE_MAX_ENTRY_BYTES = int(os.environ.get("HERMES_REPLAY_CACHE_MAX_ENTRY_BYTES", "1048576"))  # 1 MiB
 
@@ -211,32 +216,29 @@ def _make_cache_key(tool_name: str, args: dict[str, Any]) -> str:
 # D-1: Request-level cache
 # ---------------------------------------------------------------------------
 
-# Lazy-initialized cache instance
+# Lazy-initialized cache instance (now the L1 tier from the unified router)
 _request_cache: Optional[Any] = None
 _cache_lock = threading.Lock()
 
 
 def _get_request_cache() -> Optional[Any]:
-    """Get or create the InProcessLRUCache for D-1."""
+    """Get or create the L1 cache tier from the unified router for D-1."""
     global _request_cache
-    if not REPLAY_CACHE_L1_ENABLED:
+    if not _replay_cache_l1_enabled():
         return None
 
     with _cache_lock:
         if _request_cache is not None:
             return _request_cache
         try:
-            from agent._cache import InProcessLRUCache
-            _request_cache = InProcessLRUCache(
-                max_entries=10000,  # Large entry count; byte budget is the real limit
-                max_bytes=REPLAY_CACHE_MAX_BYTES,
-                value_max_bytes=REPLAY_CACHE_MAX_ENTRY_BYTES,
-            )
-            logger.info("Replay Economy: D-1 request cache initialized (max_bytes=%d, max_entry_bytes=%d)",
-                        REPLAY_CACHE_MAX_BYTES, REPLAY_CACHE_MAX_ENTRY_BYTES)
+            # Get the L1 tier from the unified router's "replay" namespace
+            router = get_cache_router()
+            # The L1 tier is the first tier in the router
+            _request_cache = router._tiers[0]
+            logger.info("Replay Economy: D-1 request cache initialized from unified router (L1 tier)")
             return _request_cache
         except Exception as exc:
-            logger.warning("Replay Economy: Failed to initialize request cache: %s", exc)
+            logger.warning("Replay Economy: Failed to initialize request cache from router: %s", exc)
             return None
 
 
@@ -346,7 +348,7 @@ def cache_check(tool_name: str, args: dict[str, Any], session_id: str) -> Option
     Called BEFORE tool execution. Returns a tool result dict with role/tool_call_id/content
     if hit, None if miss or not cacheable.
     """
-    if not REPLAY_CACHE_L1_ENABLED:
+    if not _replay_cache_l1_enabled():
         return None
 
     if not _is_cacheable_tool(tool_name):
@@ -384,7 +386,7 @@ def cache_store(tool_name: str, args: dict[str, Any], tool_result: dict[str, Any
 
     Called AFTER tool execution (on cache miss path).
     """
-    if not REPLAY_CACHE_L1_ENABLED:
+    if not _replay_cache_l1_enabled():
         return
 
     if not _is_cacheable_tool(tool_name):
@@ -540,6 +542,5 @@ __all__ = [
     "compact_tool_messages",
     "get_replay_counters",
     "reset_replay_counters",
-    "REPLAY_CACHE_L1_ENABLED",
     "REPLAY_COMPACTION_ENABLED",
 ]

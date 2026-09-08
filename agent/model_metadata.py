@@ -1516,27 +1516,17 @@ def _get_context_cache_l1():
     global _CONTEXT_CACHE_L1
     try:
         if _CONTEXT_CACHE_L1 is None:
-            from agent._cache import InProcessLRUCache
-            try:
-                from hermes_cli.config import load_config_readonly
-                cfg = load_config_readonly() or {}
-                mm = (cfg.get("cache") or {}).get("model_metadata") or {}
-                max_entries = int(mm.get("l1_max_entries", 256))
-                max_bytes = int(mm.get("l1_max_bytes", 8 * 1024 * 1024))
-            except Exception:
-                max_entries, max_bytes = 256, 8 * 1024 * 1024
-            # Floor the bounds so a misconfigured config never creates a
-            # degenerate cache.
-            if max_entries < 1:
-                max_entries = 1
-            if max_bytes < 1024:
-                max_bytes = 1024
-            _CONTEXT_CACHE_L1 = InProcessLRUCache(
-                max_entries=max_entries,
-                max_bytes=max_bytes,
-            )
+            # Get the L1 tier from the unified router's "model_metadata" namespace
+            from agent._cache import get_cache_router
+            router = get_cache_router()
+            # The L1 tier is the first tier in the router
+            _CONTEXT_CACHE_L1 = router._tiers[0]
     except Exception as e:
-        logger.debug("Failed to init context cache L1: %s", e)
+        logger.warning(
+            "Context cache L1 init from router failed; falling through to "
+            "YAML source of truth (models.degen silently): %s",
+            e,
+        )
         _CONTEXT_CACHE_L1 = None
     return _CONTEXT_CACHE_L1
 

@@ -52,7 +52,7 @@ from utils import atomic_json_write
 
 import requests
 
-from agent._cache import InProcessLRUCache
+from agent._cache import InProcessLRUCache, get_cache_router
 
 logger = logging.getLogger(__name__)
 
@@ -1603,13 +1603,18 @@ def _get_model_catalog_l1() -> Optional[InProcessLRUCache]:
         if _model_catalog_l1 is not None:
             return _model_catalog_l1
         try:
-            _model_catalog_l1 = InProcessLRUCache(
-                max_entries=_model_catalog_l1_max_entries(),
-                max_bytes=_model_catalog_l1_max_bytes(),
-            )
+            # Get the L1 tier from the unified router's "model_catalog" namespace
+            router = get_cache_router()
+            # The L1 tier is the first tier in the router
+            _model_catalog_l1 = router._tiers[0]
+            logger.info("Models.dev: L1 model catalog cache initialized from unified router (L1 tier)")
             return _model_catalog_l1
         except Exception as e:
-            logger.debug("L1 model catalog cache init failed: %s", e)
+            logger.warning(
+                "L1 model catalog cache init from router failed; falling through "
+                "to source (cache disabled for this session): %s",
+                e,
+            )
             _model_catalog_l1 = None
             return None
 

@@ -30,6 +30,8 @@ import time
 from dataclasses import asdict
 from typing import Any, Callable, Optional, TypeVar
 
+from agent._cache import get_cache_router
+
 logger = logging.getLogger(__name__)
 
 K = TypeVar("K")
@@ -146,39 +148,6 @@ def _l2_max_bytes() -> int:
 
 
 # ---------------------------------------------------------------------------
-# L1 + L2 cache construction
-# ---------------------------------------------------------------------------
-
-
-def _build_router_for_backend(basename: str):
-    """Construct a TieredCacheRouter for a single secret-source backend.
-
-    Returns None if anything fails — callers treat None as "no acceleration
-    available, use the JSON path" so a cache problem never blocks a secret
-    fetch.
-    """
-    try:
-        from agent._cache import InProcessLRUCache, FlatFileCache, TieredCacheRouter
-    except Exception as e:
-        logger.debug("Tiered cache import failed for %s: %s", basename, e)
-        return None
-
-    try:
-        l1 = InProcessLRUCache(
-            max_entries=_secrets_l1_max_entries(),
-            max_bytes=_secrets_l1_max_bytes(),
-        )
-        l2 = FlatFileCache(
-            path=_l2_path_for_backend(basename),
-            max_bytes=_l2_max_bytes(),
-        )
-        return TieredCacheRouter(l1, l2)
-    except Exception as e:
-        logger.debug("Cache construction failed for %s: %s", basename, e)
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Entry serialization
 # ---------------------------------------------------------------------------
 
@@ -235,11 +204,12 @@ def bridge_read(basename: str, key: Any, ttl_seconds: float,
     if not _is_secrets_cache_enabled() or ttl_seconds <= 0:
         return json_fallback()
 
-    router = _build_router_for_backend(basename)
+    router = get_cache_router()
     if router is None:
         return json_fallback()
 
-    serialized_key = key_serializer(key)
+    # Include basename in the key to isolate backends within the shared L1+L2
+    serialized_key = f"secrets:{basename}:{key_serializer(key)}"
     try:
         cached_payload = router.get(serialized_key)
     except Exception as e:
@@ -301,10 +271,11 @@ def bridge_write(basename: str, key: Any, entry: Any,
     """
     if not _is_secrets_cache_enabled():
         return
-    router = _build_router_for_backend(basename)
+    router = get_cache_router()
     if router is None:
         return
-    serialized_key = key_serializer(key)
+    # Include basename in the key to isolate backends within the shared L1+L2
+    serialized_key = f"secrets:{basename}:{key_serializer(key)}"
     try:
         router.put(serialized_key, _entry_to_dict(entry))
     except Exception as e:
@@ -316,12 +287,13 @@ def bridge_clear(basename: str) -> None:
     """Invalidate all cache layers for a backend. Used on secret rotation."""
     if not _is_secrets_cache_enabled():
         return
-    router = _build_router_for_backend(basename)
+    router = get_cache_router()
     if router is None:
         return
-    # The router's `invalidate` is per-key; `clear` would require a new
-    # method. The L2 mmap has a clear() method; call it directly. L1
-    # entries will be replaced on next read (best-effort invalidation).
+    # Best-effort L1 invalidation for this basename.
+    # The shared L1 uses keys prefixed with "secrets:{basename}:".
+    # We can't easily clear by prefix, so we rely on TTL/eviction for L1.
+    # L2 is cleared per-backend via the mmap file.
     try:
         from agent._cache import FlatFileCache
         path = _l2_path_for_backend(basename)

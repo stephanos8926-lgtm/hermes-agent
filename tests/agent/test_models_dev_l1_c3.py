@@ -216,15 +216,15 @@ class TestC3LRUBehavior:
     def test_l1_init_failure_returns_none(
         self, models_dev, reset_l1, monkeypatch
     ):
-        """If InProcessLRUCache itself raises during init (e.g. invalid
-        args), the function returns None and the L1 is marked None.
-        The hot path must never crash on L1 init failure."""
+        """If get_cache_router() itself raises during init, the function
+        returns None and the L1 is marked None. The hot path must never
+        crash on L1 init failure."""
         monkeypatch.setenv("HERMES_CACHE_MODEL_CATALOG_ENABLED", "true")
 
         def boom(*a, **kw):
             raise RuntimeError("L1 init failed")
 
-        monkeypatch.setattr(models_dev, "InProcessLRUCache", boom)
+        monkeypatch.setattr("agent.models_dev.get_cache_router", boom)
         # Reset the global so init runs again
         models_dev._model_catalog_l1 = None
         result = models_dev._get_model_catalog_l1()
