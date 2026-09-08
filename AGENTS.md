@@ -1789,3 +1789,35 @@ signal to do the extraction, not to regex around it.
 - `idle_promote_timeout_ms` (default 60000): silence before foreground auto-promotes to background proc. 60s is aggressive for `npm install` - raise to 120000 in AGENTS.md or `hermes config set terminal.idle_promote_timeout_ms 120000`.
 - `promote_margin_seconds` (default 30): do not promote if deadline within margin (near timeout, let timeout win).
 - `interrupt_broadcast_scope` (task|none): task-scoped kill on /stop. Set none to disable.
+
+## Cache infrastructure (unification in progress, 2026-09-06)
+
+The Hermes project has 13 distinct cache/memory subsystems. The local
+data-caching tier is being unified into **one cohesive unit** rooted in
+`agent/_cache.py` (the tiered router). See
+`docs/specs/cache-infrastructure-unified-v1.md` (SPEC v1),
+`docs/ADR.md` (the 2026-09-06 ADR), and the two companion plans:
+`docs/plans/cache-overhaul-existing-v1.md` (re-wire the 4 live consumers)
+and `docs/plans/cache-new-tiered-work-v1.md` (activate + harden L1/L2/L3).
+
+**Reference projects** are cloned to `~/.references/` (diskcache, theine,
+cachka). Re-read the matching mechanism before implementing a phase -- copy
+the pattern, never translate line-by-line.
+
+**Hard rules for this work:**
+- `config.yaml` is the sole configuration surface for the cache layer.
+  Feature gates, sizing, TTLs, backends, magic numbers, and booleans live in
+  the `cache:` block. `HERMES_CACHE_*` env vars are narrowed to
+  identity/secret operands only.
+- The tiered router currently has **zero production callers** -- enabling it
+  is a code change, not a config edit. Everything new ships behind a feature
+  flag defaulting to *off* until the config-surface phase flips it on.
+- Never trust docs over `git log` or over running the test. The cache layer
+  was documented as "done" while the router was dead code -- verify.
+- Adjacent subsystems are **not** part of this tier and must not be
+  duplicated: Anthropic prompt caching (`agent/prompt_caching.py`,
+  `prompt_cache_scope.py`, `prompt_cache_boundary.py`), context compression
+  (`agent/context_compressor.py`), tiered system-prompt blocks
+  (`agent/system_prompt.py`), and the pressure sidecars
+  (`gateway/memory_monitor.py`, `gateway/memory_status.py`,
+  `gateway/agent_cache_pressure.py`).

@@ -75,3 +75,67 @@ Consequences:
 - Regression coverage exercises the real production path
   (`set_hermes_home_override()`) rather than only the env-var path, and
   includes a dedicated relative-import leak test.
+
+## 2026-09-06: Unify the Hermes cache layer into one tiered runtime
+
+Status: Proposed (SPEC v1 written; awaiting sign-off)
+
+Context:
+The Hermes project has 13 distinct cache/memory subsystems, but the local
+data-caching tier was fragmented and partially dead:
+
+- `agent/_cache.py` (1,594 lines) already defines the right abstractions — a
+  `TieredCache` Protocol, `InProcessLRUCache` (L1), `FlatFileCache` (L2),
+  `ShardedFileCache` (L3), `RedisCache`/`DiskCache` stubs, a `TieredCacheRouter`,
+  `build_cache_from_config()`, `is_l1/l2/l3_enabled()`, and a config reader —
+  but **none of the general tiered router has a production caller**. It is
+  dead code.
+- Live consumers were ad-hoc and disjoint: `replay_economy.py` and
+  `models_dev.py` each instantiate a bare `InProcessLRUCache`; `model_metadata.py`
+  rolls its own dict + disk JSON; `secret_sources/_cache_bridge.py` runs an
+  isolated L1+L2 router of its own.
+- Adjacent subsystems (Anthropic prompt caching, context compression, tiered
+  system-prompt blocks, `memory_monitor`/`memory_status`/`agent_cache_pressure`
+  sidecars) are separate concerns and must not be duplicated by this tier.
+
+Decision:
+- Make `agent/_cache.py` the **single source of truth** for all local data
+  caching. Every current consumer is re-wired to obtain its tier through
+  `get_cache_router()` / `build_cache_from_config()` instead of instantiating a
+  bare `InProcessLRUCache` or rolling ad-hoc dicts.
+- Collapse the `secret_sources` bridge **into** the router as a
+  **namespace-scoped tier** (secrets get their own L2/L3 partition, not their
+  own engine).
+- **`config.yaml` is the sole configuration surface.** Feature gates, sizing,
+  TTLs, backends, magic numbers, and booleans live in a `cache:` block
+  (`cache.l1`, `cache.l2`, `cache.l3`, `cache.namespaces`, `cache.pressure`,
+  `cache.observe`). All current `DEFAULT_L*` constants move into that block as
+  defaults; `config_defaults.py` retains them only as schema seed values.
+- **Environment variables are narrowed** to identity/secret operands only
+  (e.g. a Redis URL carrying credentials). The existing `HERMES_CACHE_*`
+  override path is repurposed for that subset rather than acting as the
+  primary config channel.
+- Side-cars stay operational, not data-path: the router emits
+  hit/miss/size/eviction counters consumed by `agent_cache_pressure.py`; a
+  single `CacheMetrics` surface is latched by `memory_status.py`; and the
+  router degrades gracefully (L1 only) with a circuit state when an L2/L3
+  backend is unreachable (borrowed from `cachka`).
+
+Consequences:
+- One router, one config surface, one observability surface. New caches that
+  arrive later register through the same router and automatically inherit
+  tiering, eviction, TTL, and metrics.
+- L1 upgrades from the current striped-LRU to a Caffeine-style **W-TinyLFU**
+  adaptive eviction (borrowed from `theine`); L2/L3 follow the
+  `diskcache` blueprint (mmap ring + `FanoutCache` sharding, tag metadata,
+  vacuum, multiprocess-safe locking).
+- The secrets cache keeps its isolation semantics but gains the unified
+  eviction/TTL/observability contract.
+- This is a **full rebuild of the wiring**, not a flag flip — the tiered router
+  currently has zero callers, so enabling it is a code change, not a config
+  edit.
+
+References consulted (cloned to `~/.references`):
+- `diskcache` (Apache-2.0) — L2/L3 blueprint.
+- `theine` (BSD-3) — L1 W-TinyLFU upgrade.
+- `cachka` (MIT) — router + circuit breaker + observability blueprint.
