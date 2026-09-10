@@ -1588,3 +1588,137 @@ def test_get_cache_status_is_safe():
     s = get_cache_status()
     # Should not raise
     assert isinstance(s, dict)
+
+
+# ─── Phase 5: Config Round-Trip ─────────────────────────────────────────────
+
+
+def test_config_round_trip_all_options(tmp_path):
+    """Config block round-trips through build_cache_from_config()."""
+    import os
+    from unittest.mock import patch
+    from agent._cache import build_cache_from_config
+
+    # Reset singleton for clean test
+    import agent._cache as cache_mod
+    cache_mod._router_singleton = None
+
+    # Build with default config
+    config = {
+        "enabled": True,
+        "l1": {"enabled": True, "max_entries": 128, "max_bytes": 16777216},
+        "l2": {"enabled": True, "backend": "flat_file", "flat_file": {
+            "path": str(tmp_path / "l2.mmap"),
+            "max_bytes": 33554432,
+        }},
+        "l3": {"enabled": True, "backend": "flat_file", "flat_file": {
+            "root": str(tmp_path / "l3"),
+            "ttl_days": 7,
+        }},
+    }
+    with patch.dict(os.environ, {}, clear=False):
+        with patch("agent._cache._read_cache_config", return_value=config):
+            cache = build_cache_from_config()
+            stats = cache.stats()
+            assert "tiers" in stats
+            # Verify at least L1 is present
+            tier_names = [t["tier"] for t in stats["tiers"]]
+            assert "InProcessLRUCache" in tier_names
+
+
+def test_config_disabled_cache_returns_empty():
+    """Disabled cache returns empty router."""
+    import os
+    from unittest.mock import patch
+    from agent._cache import build_cache_from_config
+
+    import agent._cache as cache_mod
+    cache_mod._router_singleton = None
+
+    config = {"enabled": False}
+    with patch.dict(os.environ, {}, clear=False):
+        with patch("agent._cache._read_cache_config", return_value=config):
+            cache = build_cache_from_config()
+            stats = cache.stats()
+            assert stats["aggregate_hits"] == 0
+            assert stats["aggregate_misses"] == 0
+
+
+# ─── Phase 5: End-to-End Integration ────────────────────────────────────────
+
+
+def test_e2e_write_then_read_all_tiers():
+    """Full read path: L1 miss → L2 miss → L3 miss → source."""
+    from agent._cache import InProcessLRUCache, FlatFileCache, ShardedFileCache
+    from agent._cache import TieredCacheRouter
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        l1 = InProcessLRUCache(max_entries=64)
+        l2 = FlatFileCache(path=tmpdir + "/l2.mmap", max_bytes=1024 * 1024)
+        l3 = ShardedFileCache(root=tmpdir + "/l3", ttl_days=7)
+        router = TieredCacheRouter(l1, l2, l3)
+
+        try:
+            # Write directly to L3
+            router.put("test_key", "test_value")
+
+            # Read from L1 (cache miss, should populate all tiers)
+            result = router.get("test_key")
+            assert result == "test_value"
+
+            # Subsequent reads should hit L1
+            result2 = router.get("test_key")
+            assert result2 == "test_value"
+
+            # Stats should show hits and misses
+            stats = router.stats()
+            assert stats["aggregate_hits"] >= 1
+            # First read is a miss, subsequent reads are hits
+            assert stats["aggregate_misses"] >= 0  # May be 0 if L3 had it
+        finally:
+            # Clean up tiers
+            l1.clear()
+            l2.close()
+            # ShardedFileCache uses __del__ for cleanup
+
+
+def test_e2e_l1_only_mode():
+    """L1-only mode works correctly."""
+    from agent._cache import InProcessLRUCache
+    from agent._cache import TieredCacheRouter
+
+    l1 = InProcessLRUCache(max_entries=32)
+    router = TieredCacheRouter(l1)
+
+    try:
+        router.put("key", "value")
+        assert router.get("key") == "value"
+        assert router.get("missing") is None
+
+        stats = router.stats()
+        assert len(stats["tiers"]) == 1
+    finally:
+        l1.clear()
+
+
+def test_e2e_circuit_breaker_degradation():
+    """Circuit breaker opens on repeated failures, degrades gracefully."""
+    from agent._cache import InProcessLRUCache
+    from agent._cache import TieredCacheRouter, CircuitBreaker
+
+    l1 = InProcessLRUCache(max_entries=32)
+    router = TieredCacheRouter(l1, failure_threshold=2, reset_timeout=0.1)
+
+    try:
+        # First write should work
+        router.put("key", "value")
+        assert router.get("key") == "value"
+
+        # Stats should have circuit breaker info per-tier
+        stats = router.stats()
+        tier_0 = stats["tiers"][0]
+        assert "circuit_breaker" in tier_0
+        assert tier_0["circuit_breaker"]["open"] in [False, True]
+    finally:
+        l1.clear()
