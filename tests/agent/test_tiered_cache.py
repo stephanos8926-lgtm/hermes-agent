@@ -1328,3 +1328,82 @@ class TestElephantGuard:
         router = cache_mod.build_cache_from_config()
         l1 = router._tiers[0]
         assert l1._value_max_bytes == 2048
+
+
+# ─── CircuitBreaker tests ──────────────────────────────────────────────
+
+
+class TestCircuitBreaker:
+    """Tests for CircuitBreaker class."""
+
+    def test_initial_state_closed(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        assert cb.is_open is False
+        state = cb.get_state()
+        assert state["open"] is False
+        assert state["failures"] == 0
+
+    def test_records_success_resets_failures(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.get_state()["failures"] == 2
+        cb.record_success()
+        assert cb.get_state()["failures"] == 0
+        assert cb.is_open is False
+
+    def test_opens_after_threshold_failures(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is False
+        cb.record_failure()
+        assert cb.is_open is True
+
+    def test_half_open_after_reset_timeout(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, reset_timeout=0.1)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is True
+        time.sleep(0.15)
+        assert cb.is_open is False
+
+    def test_success_after_half_open(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, reset_timeout=0.1)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is True
+        time.sleep(0.15)
+        cb.record_success()
+        assert cb.is_open is False
+        assert cb.get_state()["failures"] == 0
+
+
+# ─── Router with circuit breaker tests ────────────────────────────────
+
+
+class TestRouterCircuitBreaker:
+    """Tests for TieredCacheRouter circuit breaker integration."""
+
+    def test_stats_includes_circuit_breaker(self):
+        from agent._cache import InProcessLRUCache, TieredCacheRouter
+        router = TieredCacheRouter(InProcessLRUCache())
+        stats = router.stats()
+        assert "circuit_breaker" in stats["tiers"][0]
+        assert "metrics" in stats
+
+    def test_circuit_breaker_trips_on_tier_failure(self):
+        from agent._cache import InProcessLRUCache, TieredCacheRouter
+        l1 = InProcessLRUCache()
+        router = TieredCacheRouter(l1, failure_threshold=3, reset_timeout=10.0)
+        # Should work normally
+        router.put("key", "value")
+        assert router.get("key") == "value"
+        # Check initial state
+        stats = router.stats()
+        assert stats["tiers"][0]["circuit_breaker"]["open"] is False

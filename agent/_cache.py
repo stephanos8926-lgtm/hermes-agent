@@ -197,6 +197,10 @@ class TieredCache(Protocol):
         """Remove *key* from the cache. No-op if the key is absent."""
         ...
 
+    def stats(self) -> dict:
+        """Return statistics about the cache tier (hits, misses, entries, etc.)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Config loader — feature-gate aware
@@ -1021,6 +1025,9 @@ class RedisCache:
     def invalidate(self, key: str) -> None:
         raise NotImplementedError("RedisCache.invalidate is not yet implemented")
 
+    def stats(self) -> dict:
+        raise NotImplementedError("RedisCache.stats is not yet implemented")
+
 
 def _build_l2_from_config() -> Optional[TieredCache]:
     """Construct the configured L2 backend, or None if L2 is disabled.
@@ -1439,6 +1446,9 @@ class DiskCache:
     def invalidate(self, key: str) -> None:
         raise NotImplementedError("DiskCache.invalidate is not yet implemented")
 
+    def stats(self) -> dict:
+        raise NotImplementedError("DiskCache.stats is not yet implemented")
+
 
 def _build_l3_from_config() -> Optional[TieredCache]:
     """Construct the configured L3 backend, or None if L3 is disabled."""
@@ -1466,6 +1476,59 @@ def _build_l3_from_config() -> Optional[TieredCache]:
 # TieredCacheRouter
 # ---------------------------------------------------------------------------
 
+class CircuitBreaker:
+    """Circuit breaker for individual cache tiers.
+
+    Tracks consecutive failures per tier. When the failure count exceeds
+    the threshold, the circuit "opens" and subsequent calls immediately
+    return a failure without attempting the tier operation.
+
+    The circuit half-opens after ``reset_timeout`` seconds, allowing a
+    single probe call to test recovery.
+    """
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 30.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._reset_timeout = reset_timeout
+        self._failures: int = 0
+        self._last_failure_time: float = 0.0
+        self._open: bool = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._open:
+                # Check if we should half-open
+                if time.monotonic() - self._last_failure_time >= self._reset_timeout:
+                    self._open = False
+                    self._failures = 0
+                    return False  # Half-open: allow probe
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open = False
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.monotonic()
+            if self._failures >= self._failure_threshold:
+                self._open = True
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "open": self._open,
+                "failures": self._failures,
+                "threshold": self._failure_threshold,
+                "last_failure_age_seconds": time.monotonic() - self._last_failure_time if self._last_failure_time else 0.0,
+            }
+
+
 class TieredCacheRouter:
     """Read-through router chaining L1 → L2 → L3 with write-back.
 
@@ -1487,22 +1550,49 @@ class TieredCacheRouter:
 
     **Fail-open**: every tier's error path is wrapped. A broken L2
     or L3 cannot take down the cache — the L1 still serves hits.
+
+    **Circuit breaker**: each tier has an independent circuit breaker.
+    When a tier fails consecutively beyond the threshold, it is marked
+    open and skipped until the reset timeout elapses.
     """
 
-    def __init__(self, *tiers: TieredCache) -> None:
+    def __init__(self, *tiers: TieredCache, failure_threshold: int = 5, reset_timeout: float = 30.0) -> None:
         if not tiers:
             raise ValueError("TieredCacheRouter requires at least one tier")
         self._tiers: Tuple[TieredCache, ...] = tuple(tiers)
+        self._breakers: Tuple[CircuitBreaker, ...] = tuple(
+            CircuitBreaker(failure_threshold=failure_threshold, reset_timeout=reset_timeout)
+            for _ in tiers
+        )
+        # Metrics counters
+        self._metrics_lock = threading.Lock()
+        self._total_gets: int = 0
+        self._total_puts: int = 0
+        self._total_invalidates: int = 0
+        self._tier_failures: list = [0] * len(tiers)
+        self._tier_hits: list = [0] * len(tiers)
 
     def get(self, key: str) -> Optional[Any]:
         # L1 → L2 → L3 walk. Write-back to higher tiers on a hit in
         # any lower tier.
+        with self._metrics_lock:
+            self._total_gets += 1
         for i, tier in enumerate(self._tiers):
+            # Check circuit breaker
+            if self._breakers[i].is_open:
+                with self._metrics_lock:
+                    self._tier_failures[i] += 1
+                continue
             try:
                 value = tier.get(key)
             except Exception:
-                # Fail-open: a tier's failure is treated as a miss.
+                self._breakers[i].record_failure()
+                with self._metrics_lock:
+                    self._tier_failures[i] += 1
                 continue
+            self._breakers[i].record_success()
+            with self._metrics_lock:
+                self._tier_hits[i] += 1
             if value is not None:
                 # Write-back to all higher (faster) tiers.
                 for higher in self._tiers[:i]:
@@ -1514,19 +1604,31 @@ class TieredCacheRouter:
         return None
 
     def put(self, key: str, value: Any) -> None:
-        for tier in self._tiers:
+        with self._metrics_lock:
+            self._total_puts += 1
+        for i, tier in enumerate(self._tiers):
+            if self._breakers[i].is_open:
+                continue
             try:
                 tier.put(key, value)
+                self._breakers[i].record_success()
             except Exception:
+                self._breakers[i].record_failure()
                 # Fail-open: one tier's failure does not block the
                 # others.
                 pass
 
     def invalidate(self, key: str) -> None:
-        for tier in self._tiers:
+        with self._metrics_lock:
+            self._total_invalidates += 1
+        for i, tier in enumerate(self._tiers):
+            if self._breakers[i].is_open:
+                continue
             try:
                 tier.invalidate(key)
+                self._breakers[i].record_success()
             except Exception:
+                self._breakers[i].record_failure()
                 pass
 
     def stats(self) -> dict:
@@ -1534,21 +1636,31 @@ class TieredCacheRouter:
         per_tier = []
         total_hits = 0
         total_misses = 0
-        for tier in self._tiers:
-            s = tier.stats() if hasattr(tier, "stats") else {}
-            per_tier.append({
-                "tier": type(tier).__name__,
-                "stats": s,
-            })
-            total_hits += s.get("hits", 0)
-            total_misses += s.get("misses", 0)
-        total = total_hits + total_misses
-        return {
-            "tiers": per_tier,
-            "aggregate_hits": total_hits,
-            "aggregate_misses": total_misses,
-            "aggregate_hit_rate": (total_hits / total) if total else 0.0,
-        }
+        with self._metrics_lock:
+            for i, tier in enumerate(self._tiers):
+                s = tier.stats() if hasattr(tier, "stats") else {}
+                breaker_state = self._breakers[i].get_state()
+                per_tier.append({
+                    "tier": type(tier).__name__,
+                    "stats": s,
+                    "circuit_breaker": breaker_state,
+                })
+                total_hits += s.get("hits", 0)
+                total_misses += s.get("misses", 0)
+            total = total_hits + total_misses
+            return {
+                "tiers": per_tier,
+                "aggregate_hits": total_hits,
+                "aggregate_misses": total_misses,
+                "aggregate_hit_rate": (total_hits / total) if total else 0.0,
+                "metrics": {
+                    "total_gets": self._total_gets,
+                    "total_puts": self._total_puts,
+                    "total_invalidates": self._total_invalidates,
+                    "tier_failures": dict(enumerate(self._tier_failures)),
+                    "tier_hits": dict(enumerate(self._tier_hits)),
+                }
+            }
 
 
 # ---------------------------------------------------------------------------
