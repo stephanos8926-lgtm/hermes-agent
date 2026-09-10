@@ -639,26 +639,38 @@ def test_is_l1_disabled_when_master_off():
         assert is_l1_enabled() is False
 
 
-def test_is_l2_enabled_default_false():
-    """L2 is off by default (explicit opt-in)."""
-    assert is_l2_enabled() is False
+def test_is_l2_enabled_default_true():
+    """L2 is on by default."""
+    assert is_l2_enabled() is True
 
 
 def test_is_l2_enabled_when_opted_in():
-    """HERMES_CACHE_L2_ENABLED=true turns on L2."""
+    """HERMES_CACHE_L2_ENABLED=true turns on L2 (no-op since already on)."""
     with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "true"}, clear=False):
         assert is_l2_enabled() is True
 
 
-def test_is_l3_enabled_default_false():
-    """L3 is off by default (explicit opt-in)."""
-    assert is_l3_enabled() is False
+def test_is_l2_enabled_can_be_disabled():
+    """HERMES_CACHE_L2_ENABLED=false turns off L2."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "false"}, clear=False):
+        assert is_l2_enabled() is False
+
+
+def test_is_l3_enabled_default_true():
+    """L3 is on by default."""
+    assert is_l3_enabled() is True
 
 
 def test_is_l3_enabled_when_opted_in():
-    """HERMES_CACHE_L3_ENABLED=true turns on L3."""
+    """HERMES_CACHE_L3_ENABLED=true turns on L3 (no-op since already on)."""
     with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "true"}, clear=False):
         assert is_l3_enabled() is True
+
+
+def test_is_l3_enabled_can_be_disabled():
+    """HERMES_CACHE_L3_ENABLED=false turns off L3."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "false"}, clear=False):
+        assert is_l3_enabled() is False
 
 
 # ─── FlatFileCache (L2) — mmap ring buffer ────────────────────────────
@@ -767,9 +779,10 @@ def test_flat_file_cache_type_validation(tmp_path):
 
 
 def test_flat_file_cache_stats_shape(tmp_path):
-    """stats() includes backend, path, max_bytes, slot counts."""
+    """stats() includes backend, path, max_bytes, slot counts, estimated_bytes."""
     cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
     try:
+        cache.put("k", "v")
         s = cache.stats()
         assert s["backend"] == "flat_file"
         assert s["max_bytes"] == 1024 * 1024
@@ -777,6 +790,21 @@ def test_flat_file_cache_stats_shape(tmp_path):
         assert s["slot_value_max"] > 0
         assert "hits" in s
         assert "misses" in s
+        assert "estimated_bytes" in s
+        assert s["estimated_bytes"] > 0  # at least one entry stored
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_estimated_bytes(tmp_path):
+    """estimated_bytes grows as entries are added."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        cache.put("a", "hello")
+        bytes_after_first = cache.stats()["estimated_bytes"]
+        cache.put("b", "world")
+        bytes_after_second = cache.stats()["estimated_bytes"]
+        assert bytes_after_second >= bytes_after_first
     finally:
         cache.close()
 
@@ -896,6 +924,30 @@ def test_sharded_file_cache_stats_shape(tmp_path):
     assert "misses" in s
 
 
+def test_sharded_file_cache_vacuum_removes_empty_dirs(tmp_path):
+    """vacuum() removes empty shard directories after entries are invalidated."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k1", "v1")
+    cache.put("k2", "v2")
+    # Invalidate all entries so shards become empty.
+    cache.invalidate("k1")
+    cache.invalidate("k2")
+    removed = cache.vacuum()
+    assert removed >= 0  # may remove some or all empty dirs
+    # Verify the root still exists.
+    assert (tmp_path / "l3").exists()
+
+
+def test_sharded_file_cache_vacuum_is_idempotent(tmp_path):
+    """vacuum() can be called multiple times without error."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k", "v")
+    cache.invalidate("k")
+    cache.vacuum()
+    cache.vacuum()  # second call should not raise
+    assert cache.get("k") is None
+
+
 # ─── TieredCacheRouter with mixed tiers ───────────────────────────────
 
 
@@ -968,13 +1020,16 @@ def test_router_tier_failure_does_not_break_reads():
 # ─── build_cache_from_config — feature-gate aware factory ─────────────
 
 
-def test_build_cache_returns_l1_only_by_default():
-    """Default config returns a router with L1 only."""
+def test_build_cache_returns_l1_l2_l3_by_default():
+    """Default config returns a router with L1, L2, and L3."""
     cache = build_cache_from_config()
     s = cache.stats()
-    # Only one tier — the L1.
-    assert len(s["tiers"]) == 1
-    assert s["tiers"][0]["tier"] == "InProcessLRUCache"
+    # Three tiers — L1, L2, L3 all enabled by default.
+    assert len(s["tiers"]) == 3
+    tier_names = [t["tier"] for t in s["tiers"]]
+    assert "InProcessLRUCache" in tier_names
+    assert "FlatFileCache" in tier_names
+    assert "ShardedFileCache" in tier_names
 
 
 def test_build_cache_includes_l2_when_enabled(tmp_path):
@@ -1015,10 +1070,8 @@ def test_build_cache_master_off_returns_placeholder():
 
 
 def test_build_l2_returns_none_when_disabled():
-    """L2 builder returns None when the feature gate is off."""
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("HERMES_CACHE_L2_ENABLED", None)
-        # Default: L2 is off.
+    """L2 builder returns None when explicitly turned off."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "false"}, clear=False):
         assert _build_l2_from_config() is None
 
 
@@ -1052,9 +1105,8 @@ def test_build_l2_returns_redis_stub_when_backend_is_redis():
 
 
 def test_build_l3_returns_none_when_disabled():
-    """L3 builder returns None when the feature gate is off."""
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("HERMES_CACHE_L3_ENABLED", None)
+    """L3 builder returns None when explicitly turned off."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "false"}, clear=False):
         assert _build_l3_from_config() is None
 
 

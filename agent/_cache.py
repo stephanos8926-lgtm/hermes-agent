@@ -271,7 +271,7 @@ def _read_cache_config() -> dict:
             },
         },
         "l2": {
-            "enabled": False,
+            "enabled": True,
             "backend": "flat_file",
             "flat_file": {
                 "path": DEFAULT_L2_FLAT_FILE_PATH,
@@ -285,7 +285,7 @@ def _read_cache_config() -> dict:
             },
         },
         "l3": {
-            "enabled": False,
+            "enabled": True,
             "backend": "sharded_file",
             "sharded_file": {
                 "root": DEFAULT_L3_SHARDED_ROOT,
@@ -904,11 +904,16 @@ class _FlatFileRing:
             # tradeoff for a fixed-size ring buffer.
             with open(self._path, "r+b") as f:
                 f.truncate(self._max_bytes)
-        # Open and mmap. Read-only mode skips the flock on writers.
+        # Open and mmap. Use flock for cross-process serialization.
         self._fd = os.open(
             str(self._path),
             os.O_RDWR if not self._read_only else os.O_RDONLY,
         )
+        if not self._read_only:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+            except OSError:
+                pass  # Best-effort; mmap alone is safer than nothing.
         # PROT_READ always; PROT_WRITE only when not read-only.
         prot = mmap.PROT_READ if self._read_only else mmap.PROT_READ | mmap.PROT_WRITE
         self._mm = mmap.mmap(self._fd, self._max_bytes, prot=prot)
@@ -1130,6 +1135,20 @@ class _FlatFileRing:
         except Exception:
             pass
 
+    @property
+    def estimated_bytes(self) -> int:
+        """Rough estimate of bytes currently stored."""
+        with self._lock:
+            if self._mm is None:
+                return 0
+            count = sum(
+                1 for i in range(self._slot_count)
+                if (struct.unpack_from(
+                    self.SLOT_HEADER_FMT, self._mm, self._slot_offset(i)
+                )[1] & self.LENGTH_MASK) > 0
+            )
+            return count * self.SLOT_VALUE_MAX
+
     def stats(self) -> dict:
         """Return a snapshot of cache statistics."""
         with self._lock:
@@ -1141,6 +1160,7 @@ class _FlatFileRing:
                 "slot_count": self._slot_count,
                 "slot_value_max": self.SLOT_VALUE_MAX,
                 "read_only": self._read_only,
+                "estimated_bytes": self.estimated_bytes,
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": (self.hits / total) if total else 0.0,
@@ -1342,7 +1362,10 @@ class FlatFileCache:
                 agg["slot_count"] = st.get("slot_count")
                 agg["slot_value_max"] = st.get("slot_value_max")
                 agg["read_only"] = st.get("read_only")
+                agg["estimated_bytes"] = st.get("estimated_bytes", 0)
                 first = False
+            else:
+                agg["estimated_bytes"] = agg.get("estimated_bytes", 0) + st.get("estimated_bytes", 0)
         total = agg["hits"] + agg["misses"]
         agg["hit_rate"] = (agg["hits"] / total) if total else 0.0
         return agg
@@ -1552,15 +1575,61 @@ class ShardedFileCache:
                 self.invalidate(k)
             return len(expired_keys)
 
+    def vacuum(self) -> int:
+        """Compact the directory tree by removing empty shards.
+
+        Walks all top-level shard dirs, removes mid-level dirs that
+        contain no files, then removes top-level dirs that have no
+        subdirs. Returns the number of directories removed.
+
+        Safe to call frequently — O(directory_count) not O(entry_count).
+        """
+        removed = 0
+        with self._lock:
+            self._build_index()
+            if not self._root.exists():
+                return 0
+            for top_dir in sorted(self._root.iterdir(), reverse=True):
+                if not top_dir.is_dir():
+                    continue
+                for mid_dir in sorted(top_dir.iterdir(), reverse=True):
+                    if not mid_dir.is_dir():
+                        continue
+                    files = list(mid_dir.iterdir())
+                    if not files:
+                        try:
+                            mid_dir.rmdir()
+                            removed += 1
+                        except OSError:
+                            pass
+                    else:
+                        # Remove any orphan .json sidecars with no data file.
+                        for f in mid_dir.iterdir():
+                            if f.name.endswith(".json") and not f.with_suffix("").exists():
+                                try:
+                                    f.unlink()
+                                    removed += 1
+                                except OSError:
+                                    pass
+                # Remove top-level dir if now empty.
+                if not any(top_dir.iterdir()):
+                    try:
+                        top_dir.rmdir()
+                        removed += 1
+                    except OSError:
+                        pass
+        return removed
+
     def stats(self) -> dict:
         """Return a snapshot of cache statistics."""
         with self._lock:
             total = self.hits + self.misses
+            entry_count = len(self._index) if self._index_built else 0
             return {
                 "backend": "sharded_file",
                 "root": str(self._root),
                 "ttl_days": self._ttl_seconds // 86400,
-                "entries": len(self._index),
+                "entries": entry_count,
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": (self.hits / total) if total else 0.0,
