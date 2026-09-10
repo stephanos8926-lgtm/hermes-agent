@@ -3972,6 +3972,19 @@ async def get_status(profile: Optional[str] = None):
         except Exception:
             status["memory"] = {"pressure": "unknown"}
 
+        # Cache metrics rollup (NS-XXX): surface tiered-cache hit rates
+        # and per-tier stats so the dashboard can render a cache health
+        # indicator. One stats() call on the singleton — fast, read-only.
+        try:
+            from agent._cache import get_cache_status
+
+            status["cache"] = await asyncio.get_running_loop().run_in_executor(
+                None,
+                get_cache_status,
+            )
+        except Exception:
+            status["cache"] = {"status": "unavailable"}
+
         # Disk-usage rollup (NS-656, same lineage as OOF-2/OOF-107 fleet
         # disk-exhaustion incidents). One statvfs call on HERMES_HOME's
         # filesystem — coarse MB numbers + enum, same public disclosure

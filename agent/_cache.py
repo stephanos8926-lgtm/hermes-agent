@@ -1972,3 +1972,22 @@ def get_cache_router() -> TieredCache:
             if _router_singleton is None:
                 _router_singleton = build_cache_from_config()
     return _router_singleton
+
+
+def get_cache_status() -> dict:
+    """Return a JSON-serializable snapshot of cache metrics.
+
+    Safe to call from the status endpoint — never raises.
+    Returns the router's stats() output, or a degraded dict on error.
+    """
+    try:
+        router = get_cache_router()
+        return router.stats()
+    except Exception:
+        return {
+            "error": "cache_unavailable",
+            "tiers": [],
+            "aggregate_hits": 0,
+            "aggregate_misses": 0,
+            "aggregate_hit_rate": 0.0,
+        }

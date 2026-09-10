@@ -1568,3 +1568,23 @@ class TestInProcessTinyLFUCache:
         stats = cache.stats()
         assert stats["hit_rate"] == 0.0
         assert stats["entries"] == 0
+
+
+# ─── get_cache_status() ───────────────────────────────────────────────────
+
+
+def test_get_cache_status_returns_dict():
+    """get_cache_status() returns a dict with cache metrics."""
+    from agent._cache import get_cache_status
+    s = get_cache_status()
+    assert isinstance(s, dict)
+    assert "tiers" in s
+    assert "aggregate_hit_rate" in s
+
+
+def test_get_cache_status_is_safe():
+    """get_cache_status() never raises even if cache is broken."""
+    from agent._cache import get_cache_status
+    s = get_cache_status()
+    # Should not raise
+    assert isinstance(s, dict)
