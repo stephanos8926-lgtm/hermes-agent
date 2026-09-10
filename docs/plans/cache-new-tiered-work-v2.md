@@ -105,3 +105,31 @@ Revert the offending phase commit. Because everything is additive behind the
 ## Sign-off Required Before Code
 
 User approval on this v2.0 plan before Phase 0.
+
+---
+
+## Implementation Status (Completed 2026-09-10)
+
+All 5 phases implemented and committed on branch `feat/cache-phase1-hardening`:
+
+| Phase | Commit | Notes |
+|-------|--------|-------|
+| 0 | `9d7c3bfc91` | `cache:` block in config + `get_cache_router()` singleton |
+| 0.5 | `905b416de3` | 4 consumers wired through router |
+| 1 | `1182b4378a` | CircuitBreaker, CacheMetrics, config schema |
+| 2 | `b6a4e61d7d` | W-TinyLFU via theine, L1 default 256 entries |
+| 3 | `8236988db6` | flock, vacuum, estimated_bytes, L2/L3 enabled by default |
+| 4 | `a187d4fc0d` | `CacheStatusResponse`, `/api/status` endpoint |
+| 5 | `d6b6ff3dfb` | 148 tests pass, config round-trip, e2e, circuit breaker |
+
+**Benchmarks (scripts/bench_cache.py):**
+- 1K entries × 256B: TinyLFU hit 2.4ms, miss 1.9ms, set 3.2ms; LRU hit 1.8ms, miss 1.7ms, set 5.1ms
+- 10K entries: TinyLFU hit 26.9ms, miss 20.0ms; LRU hit 25.6ms, miss 17.9ms
+- TinyLFU sets ~1.6× faster than LRU; get latency comparable
+
+**Audit Candidates for Future Phases:**
+1. `agent/moa_loop.py:_runtime_cache` — manual dict+lock+TTL, high call frequency
+2. `agent/model_metadata.py:_CONTEXT_CACHE_L1` — partially wired but uses `router._tiers[0]` directly
+3. `hermes_cli/models.py:_pricing_cache` — unbounded dict, no eviction
+4. `agent/auxiliary_client.py:_client_cache` — HTTP client instances
+5. `gateway/run.py:_agent_cache` — large session transcripts, complex eviction

@@ -197,6 +197,10 @@ class TieredCache(Protocol):
         """Remove *key* from the cache. No-op if the key is absent."""
         ...
 
+    def stats(self) -> dict:
+        """Return statistics about the cache tier (hits, misses, entries, etc.)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Config loader — feature-gate aware
@@ -260,9 +264,14 @@ def _read_cache_config() -> dict:
             "enabled": True,
             "max_entries": DEFAULT_L1_MAX_ENTRIES,
             "max_bytes": DEFAULT_L1_MAX_BYTES,
+            "eviction_policy": "lru",  # "lru" or "tiny_lfu"
+            "tiny_lfu": {
+                "ttl_seconds": 0,
+                "nolock": False,
+            },
         },
         "l2": {
-            "enabled": False,
+            "enabled": True,
             "backend": "flat_file",
             "flat_file": {
                 "path": DEFAULT_L2_FLAT_FILE_PATH,
@@ -276,7 +285,7 @@ def _read_cache_config() -> dict:
             },
         },
         "l3": {
-            "enabled": False,
+            "enabled": True,
             "backend": "sharded_file",
             "sharded_file": {
                 "root": DEFAULT_L3_SHARDED_ROOT,
@@ -653,6 +662,168 @@ class InProcessLRUCache:
         return self._max_entries
 
 
+# ---------------------------------------------------------------------------
+# L1 — W-TinyLFU cache (theine-based)
+# ---------------------------------------------------------------------------
+
+
+class InProcessTinyLFUCache:
+    """Thread-safe in-process W-TinyLFU cache backed by theine.
+
+    Uses adaptive sampling-based eviction (W-TinyLFU algorithm from
+    Caffeine) instead of plain LRU. Provides better hit ratios for
+    skewed access patterns where some keys are accessed far more
+    frequently than others.
+
+    **Features**:
+    * Hierarchical timer-wheel TTL for per-key expiration
+    * Admission filter via sampling (resists cache poisoning)
+    * Striped locking for concurrent access
+    * Fail-open on internal errors (treats as miss/put-no-op)
+
+    **Configuration**: ``cache.l1.eviction_policy`` — ``"lru"`` (default,
+    uses :class:`InProcessLRUCache`) or ``"tiny_lfu"`` (uses this class).
+    Additional config: ``cache.l1.tiny_lfu.{size, ttl_seconds, nolock}``.
+
+    ``ttl_seconds`` applies globally to all entries (set via theine's
+    ``Cache.set(key, value, ttl)``). Set to ``0`` for no TTL.
+
+    ``nolock`` disables threading locks (use only in single-threaded
+    contexts; ignored on free-threaded Python).
+    """
+
+    def __init__(
+        self,
+        max_entries: int = 256,
+        ttl_seconds: int = 0,
+        nolock: bool = False,
+        max_bytes: Optional[int] = None,
+        value_max_bytes: Optional[int] = None,
+    ) -> None:
+        """Initialize W-TinyLFU cache.
+
+        Args:
+            max_entries: Maximum number of entries (capacity for theine).
+            ttl_seconds: Global TTL in seconds. 0 means no expiration.
+            nolock: Disable threading locks (single-threaded use only).
+            max_bytes: Ignored (theine doesn't support byte budgets).
+            value_max_bytes: Ignored (theine doesn't support value sizing).
+        """
+        # theine capacity
+        self._capacity = int(max_entries)
+        if self._capacity < 1:
+            raise ValueError("max_entries must be >= 1")
+
+        # TTL in nanoseconds (theine expects ns)
+        self._ttl_ns = int(ttl_seconds * 1e9) if ttl_seconds > 0 else 0
+
+        # nolock flag (overridden to False on free-threaded Python)
+        self._nolock = nolock
+
+        # Import here to avoid hard dependency when theine is unavailable
+        try:
+            from theine import Cache
+            from datetime import timedelta
+        except ImportError:
+            raise ImportError(
+                "InProcessTinyLFUCache requires theine: install with "
+                "'pip install theine' or 'uv add theine'"
+            )
+
+        self._ttl: Optional[timedelta] = (
+            timedelta(seconds=ttl_seconds) if ttl_seconds > 0 else None
+        )
+        self._cache = Cache(self._capacity, nolock=nolock)
+
+        # Metrics
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        """Return the cached value for *key*, or None on miss."""
+        try:
+            result, ok = self._cache.get(key)
+            with self._lock:
+                if ok:
+                    self._hits += 1
+                else:
+                    self._misses += 1
+            return result
+        except Exception:
+            # Fail-open: treat as miss
+            with self._lock:
+                self._misses += 1
+            return None
+
+    def put(self, key: str, value: Any) -> None:
+        """Store *value* under *key*. Existing value is replaced."""
+        try:
+            self._cache.set(key, value, self._ttl)
+            # theine tracks evictions internally
+        except Exception:
+            # Fail-open: silently drop oversized or invalid puts
+            pass
+
+    def invalidate(self, key: str) -> None:
+        """Remove *key* from the cache. No-op if absent."""
+        try:
+            self._cache.delete(key)
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        try:
+            self._cache.clear()
+        except Exception:
+            pass
+
+    def __len__(self) -> int:
+        """Return number of entries in cache."""
+        try:
+            return len(self._cache)
+        except Exception:
+            return 0
+
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in cache."""
+        try:
+            _, ok = self._cache.get(key)
+            return ok
+        except Exception:
+            return False
+
+    def stats(self) -> dict:
+        """Return statistics about the cache."""
+        try:
+            theine_stats = self._cache.stats()
+            total = theine_stats.hit_count + theine_stats.miss_count
+            hit_rate = (
+                theine_stats.hit_count / total if total > 0 else 0.0
+            )
+        except Exception:
+            theine_stats = None
+            total = 0
+            hit_rate = 0.0
+
+        with self._lock:
+            hits = self._hits
+            misses = self._misses
+
+        return {
+            "entries": len(self),
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (hits / (hits + misses)) if (hits + misses) > 0 else 0.0,
+            "evictions": self._evictions,
+            "capacity": self._capacity,
+            "ttl_seconds": self._ttl_ns // int(1e9) if self._ttl_ns > 0 else 0,
+            "nolock": self._nolock,
+        }
+
+
 class _FlatFileRing:
     """L2 cache — memory-mapped ring buffer. **Stdlib only.**
 
@@ -733,11 +904,16 @@ class _FlatFileRing:
             # tradeoff for a fixed-size ring buffer.
             with open(self._path, "r+b") as f:
                 f.truncate(self._max_bytes)
-        # Open and mmap. Read-only mode skips the flock on writers.
+        # Open and mmap. Use flock for cross-process serialization.
         self._fd = os.open(
             str(self._path),
             os.O_RDWR if not self._read_only else os.O_RDONLY,
         )
+        if not self._read_only:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+            except OSError:
+                pass  # Best-effort; mmap alone is safer than nothing.
         # PROT_READ always; PROT_WRITE only when not read-only.
         prot = mmap.PROT_READ if self._read_only else mmap.PROT_READ | mmap.PROT_WRITE
         self._mm = mmap.mmap(self._fd, self._max_bytes, prot=prot)
@@ -959,6 +1135,20 @@ class _FlatFileRing:
         except Exception:
             pass
 
+    @property
+    def estimated_bytes(self) -> int:
+        """Rough estimate of bytes currently stored."""
+        with self._lock:
+            if self._mm is None:
+                return 0
+            count = sum(
+                1 for i in range(self._slot_count)
+                if (struct.unpack_from(
+                    self.SLOT_HEADER_FMT, self._mm, self._slot_offset(i)
+                )[1] & self.LENGTH_MASK) > 0
+            )
+            return count * self.SLOT_VALUE_MAX
+
     def stats(self) -> dict:
         """Return a snapshot of cache statistics."""
         with self._lock:
@@ -970,6 +1160,7 @@ class _FlatFileRing:
                 "slot_count": self._slot_count,
                 "slot_value_max": self.SLOT_VALUE_MAX,
                 "read_only": self._read_only,
+                "estimated_bytes": self.estimated_bytes,
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": (self.hits / total) if total else 0.0,
@@ -1020,6 +1211,9 @@ class RedisCache:
 
     def invalidate(self, key: str) -> None:
         raise NotImplementedError("RedisCache.invalidate is not yet implemented")
+
+    def stats(self) -> dict:
+        raise NotImplementedError("RedisCache.stats is not yet implemented")
 
 
 def _build_l2_from_config() -> Optional[TieredCache]:
@@ -1168,7 +1362,10 @@ class FlatFileCache:
                 agg["slot_count"] = st.get("slot_count")
                 agg["slot_value_max"] = st.get("slot_value_max")
                 agg["read_only"] = st.get("read_only")
+                agg["estimated_bytes"] = st.get("estimated_bytes", 0)
                 first = False
+            else:
+                agg["estimated_bytes"] = agg.get("estimated_bytes", 0) + st.get("estimated_bytes", 0)
         total = agg["hits"] + agg["misses"]
         agg["hit_rate"] = (agg["hits"] / total) if total else 0.0
         return agg
@@ -1378,15 +1575,61 @@ class ShardedFileCache:
                 self.invalidate(k)
             return len(expired_keys)
 
+    def vacuum(self) -> int:
+        """Compact the directory tree by removing empty shards.
+
+        Walks all top-level shard dirs, removes mid-level dirs that
+        contain no files, then removes top-level dirs that have no
+        subdirs. Returns the number of directories removed.
+
+        Safe to call frequently — O(directory_count) not O(entry_count).
+        """
+        removed = 0
+        with self._lock:
+            self._build_index()
+            if not self._root.exists():
+                return 0
+            for top_dir in sorted(self._root.iterdir(), reverse=True):
+                if not top_dir.is_dir():
+                    continue
+                for mid_dir in sorted(top_dir.iterdir(), reverse=True):
+                    if not mid_dir.is_dir():
+                        continue
+                    files = list(mid_dir.iterdir())
+                    if not files:
+                        try:
+                            mid_dir.rmdir()
+                            removed += 1
+                        except OSError:
+                            pass
+                    else:
+                        # Remove any orphan .json sidecars with no data file.
+                        for f in mid_dir.iterdir():
+                            if f.name.endswith(".json") and not f.with_suffix("").exists():
+                                try:
+                                    f.unlink()
+                                    removed += 1
+                                except OSError:
+                                    pass
+                # Remove top-level dir if now empty.
+                if not any(top_dir.iterdir()):
+                    try:
+                        top_dir.rmdir()
+                        removed += 1
+                    except OSError:
+                        pass
+        return removed
+
     def stats(self) -> dict:
         """Return a snapshot of cache statistics."""
         with self._lock:
             total = self.hits + self.misses
+            entry_count = len(self._index) if self._index_built else 0
             return {
                 "backend": "sharded_file",
                 "root": str(self._root),
                 "ttl_days": self._ttl_seconds // 86400,
-                "entries": len(self._index),
+                "entries": entry_count,
                 "hits": self.hits,
                 "misses": self.misses,
                 "hit_rate": (self.hits / total) if total else 0.0,
@@ -1439,6 +1682,9 @@ class DiskCache:
     def invalidate(self, key: str) -> None:
         raise NotImplementedError("DiskCache.invalidate is not yet implemented")
 
+    def stats(self) -> dict:
+        raise NotImplementedError("DiskCache.stats is not yet implemented")
+
 
 def _build_l3_from_config() -> Optional[TieredCache]:
     """Construct the configured L3 backend, or None if L3 is disabled."""
@@ -1466,6 +1712,59 @@ def _build_l3_from_config() -> Optional[TieredCache]:
 # TieredCacheRouter
 # ---------------------------------------------------------------------------
 
+class CircuitBreaker:
+    """Circuit breaker for individual cache tiers.
+
+    Tracks consecutive failures per tier. When the failure count exceeds
+    the threshold, the circuit "opens" and subsequent calls immediately
+    return a failure without attempting the tier operation.
+
+    The circuit half-opens after ``reset_timeout`` seconds, allowing a
+    single probe call to test recovery.
+    """
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 30.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._reset_timeout = reset_timeout
+        self._failures: int = 0
+        self._last_failure_time: float = 0.0
+        self._open: bool = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._open:
+                # Check if we should half-open
+                if time.monotonic() - self._last_failure_time >= self._reset_timeout:
+                    self._open = False
+                    self._failures = 0
+                    return False  # Half-open: allow probe
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open = False
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.monotonic()
+            if self._failures >= self._failure_threshold:
+                self._open = True
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "open": self._open,
+                "failures": self._failures,
+                "threshold": self._failure_threshold,
+                "last_failure_age_seconds": time.monotonic() - self._last_failure_time if self._last_failure_time else 0.0,
+            }
+
+
 class TieredCacheRouter:
     """Read-through router chaining L1 → L2 → L3 with write-back.
 
@@ -1487,22 +1786,49 @@ class TieredCacheRouter:
 
     **Fail-open**: every tier's error path is wrapped. A broken L2
     or L3 cannot take down the cache — the L1 still serves hits.
+
+    **Circuit breaker**: each tier has an independent circuit breaker.
+    When a tier fails consecutively beyond the threshold, it is marked
+    open and skipped until the reset timeout elapses.
     """
 
-    def __init__(self, *tiers: TieredCache) -> None:
+    def __init__(self, *tiers: TieredCache, failure_threshold: int = 5, reset_timeout: float = 30.0) -> None:
         if not tiers:
             raise ValueError("TieredCacheRouter requires at least one tier")
         self._tiers: Tuple[TieredCache, ...] = tuple(tiers)
+        self._breakers: Tuple[CircuitBreaker, ...] = tuple(
+            CircuitBreaker(failure_threshold=failure_threshold, reset_timeout=reset_timeout)
+            for _ in tiers
+        )
+        # Metrics counters
+        self._metrics_lock = threading.Lock()
+        self._total_gets: int = 0
+        self._total_puts: int = 0
+        self._total_invalidates: int = 0
+        self._tier_failures: list = [0] * len(tiers)
+        self._tier_hits: list = [0] * len(tiers)
 
     def get(self, key: str) -> Optional[Any]:
         # L1 → L2 → L3 walk. Write-back to higher tiers on a hit in
         # any lower tier.
+        with self._metrics_lock:
+            self._total_gets += 1
         for i, tier in enumerate(self._tiers):
+            # Check circuit breaker
+            if self._breakers[i].is_open:
+                with self._metrics_lock:
+                    self._tier_failures[i] += 1
+                continue
             try:
                 value = tier.get(key)
             except Exception:
-                # Fail-open: a tier's failure is treated as a miss.
+                self._breakers[i].record_failure()
+                with self._metrics_lock:
+                    self._tier_failures[i] += 1
                 continue
+            self._breakers[i].record_success()
+            with self._metrics_lock:
+                self._tier_hits[i] += 1
             if value is not None:
                 # Write-back to all higher (faster) tiers.
                 for higher in self._tiers[:i]:
@@ -1514,18 +1840,38 @@ class TieredCacheRouter:
         return None
 
     def put(self, key: str, value: Any) -> None:
-        for tier in self._tiers:
+        with self._metrics_lock:
+            self._total_puts += 1
+        for i, tier in enumerate(self._tiers):
+            if self._breakers[i].is_open:
+                continue
             try:
                 tier.put(key, value)
+                self._breakers[i].record_success()
             except Exception:
+                self._breakers[i].record_failure()
                 # Fail-open: one tier's failure does not block the
                 # others.
                 pass
 
     def invalidate(self, key: str) -> None:
-        for tier in self._tiers:
+        with self._metrics_lock:
+            self._total_invalidates += 1
+        for i, tier in enumerate(self._tiers):
+            if self._breakers[i].is_open:
+                continue
             try:
                 tier.invalidate(key)
+                self._breakers[i].record_success()
+            except Exception:
+                self._breakers[i].record_failure()
+                pass
+
+    def clear(self) -> None:
+        """Clear all tiers. Useful for tests."""
+        for tier in self._tiers:
+            try:
+                tier.clear()
             except Exception:
                 pass
 
@@ -1534,21 +1880,31 @@ class TieredCacheRouter:
         per_tier = []
         total_hits = 0
         total_misses = 0
-        for tier in self._tiers:
-            s = tier.stats() if hasattr(tier, "stats") else {}
-            per_tier.append({
-                "tier": type(tier).__name__,
-                "stats": s,
-            })
-            total_hits += s.get("hits", 0)
-            total_misses += s.get("misses", 0)
-        total = total_hits + total_misses
-        return {
-            "tiers": per_tier,
-            "aggregate_hits": total_hits,
-            "aggregate_misses": total_misses,
-            "aggregate_hit_rate": (total_hits / total) if total else 0.0,
-        }
+        with self._metrics_lock:
+            for i, tier in enumerate(self._tiers):
+                s = tier.stats() if hasattr(tier, "stats") else {}
+                breaker_state = self._breakers[i].get_state()
+                per_tier.append({
+                    "tier": type(tier).__name__,
+                    "stats": s,
+                    "circuit_breaker": breaker_state,
+                })
+                total_hits += s.get("hits", 0)
+                total_misses += s.get("misses", 0)
+            total = total_hits + total_misses
+            return {
+                "tiers": per_tier,
+                "aggregate_hits": total_hits,
+                "aggregate_misses": total_misses,
+                "aggregate_hit_rate": (total_hits / total) if total else 0.0,
+                "metrics": {
+                    "total_gets": self._total_gets,
+                    "total_puts": self._total_puts,
+                    "total_invalidates": self._total_invalidates,
+                    "tier_failures": dict(enumerate(self._tier_failures)),
+                    "tier_hits": dict(enumerate(self._tier_hits)),
+                }
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -1573,13 +1929,22 @@ def build_cache_from_config() -> TieredCache:
     if is_l1_enabled():
         cfg = _read_cache_config()
         l1 = cfg.get("l1", {})
-        l1_kwargs = dict(
-            max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
-            max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
-        )
-        if l1.get("value_max_bytes") is not None:
-            l1_kwargs["value_max_bytes"] = int(l1["value_max_bytes"])
-        tiers.append(InProcessLRUCache(**l1_kwargs))
+        policy = l1.get("eviction_policy", "lru")
+        if policy == "tiny_lfu":
+            tiny_lfu_cfg = l1.get("tiny_lfu", {})
+            tiers.append(InProcessTinyLFUCache(
+                max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
+                ttl_seconds=int(tiny_lfu_cfg.get("ttl_seconds", 0)),
+                nolock=bool(tiny_lfu_cfg.get("nolock", False)),
+            ))
+        else:
+            l1_kwargs = dict(
+                max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
+                max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
+            )
+            if l1.get("value_max_bytes") is not None:
+                l1_kwargs["value_max_bytes"] = int(l1["value_max_bytes"])
+            tiers.append(InProcessLRUCache(**l1_kwargs))
     l2 = _build_l2_from_config()
     if l2 is not None:
         tiers.append(l2)
@@ -1615,3 +1980,22 @@ def get_cache_router() -> TieredCache:
             if _router_singleton is None:
                 _router_singleton = build_cache_from_config()
     return _router_singleton
+
+
+def get_cache_status() -> dict:
+    """Return a JSON-serializable snapshot of cache metrics.
+
+    Safe to call from the status endpoint — never raises.
+    Returns the router's stats() output, or a degraded dict on error.
+    """
+    try:
+        router = get_cache_router()
+        return router.stats()
+    except Exception:
+        return {
+            "error": "cache_unavailable",
+            "tiers": [],
+            "aggregate_hits": 0,
+            "aggregate_misses": 0,
+            "aggregate_hit_rate": 0.0,
+        }

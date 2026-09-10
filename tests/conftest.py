@@ -1782,3 +1782,13 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache_router():
+    """Clear the unified cache router singleton between tests to prevent
+    cross-test contamination."""
+    from agent import _cache
+    _cache._router_singleton = None
+    yield
+    _cache._router_singleton = None

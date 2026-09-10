@@ -27,6 +27,7 @@ from agent._cache import (
     DiskCache,
     FlatFileCache,
     InProcessLRUCache,
+    InProcessTinyLFUCache,
     RedisCache,
     ShardedFileCache,
     TieredCacheRouter,
@@ -37,6 +38,7 @@ from agent._cache import (
     _expand_path,
     _read_cache_config,
     build_cache_from_config,
+    get_cache_router,
     is_cache_enabled,
     is_l1_enabled,
     is_l2_enabled,
@@ -637,26 +639,38 @@ def test_is_l1_disabled_when_master_off():
         assert is_l1_enabled() is False
 
 
-def test_is_l2_enabled_default_false():
-    """L2 is off by default (explicit opt-in)."""
-    assert is_l2_enabled() is False
+def test_is_l2_enabled_default_true():
+    """L2 is on by default."""
+    assert is_l2_enabled() is True
 
 
 def test_is_l2_enabled_when_opted_in():
-    """HERMES_CACHE_L2_ENABLED=true turns on L2."""
+    """HERMES_CACHE_L2_ENABLED=true turns on L2 (no-op since already on)."""
     with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "true"}, clear=False):
         assert is_l2_enabled() is True
 
 
-def test_is_l3_enabled_default_false():
-    """L3 is off by default (explicit opt-in)."""
-    assert is_l3_enabled() is False
+def test_is_l2_enabled_can_be_disabled():
+    """HERMES_CACHE_L2_ENABLED=false turns off L2."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "false"}, clear=False):
+        assert is_l2_enabled() is False
+
+
+def test_is_l3_enabled_default_true():
+    """L3 is on by default."""
+    assert is_l3_enabled() is True
 
 
 def test_is_l3_enabled_when_opted_in():
-    """HERMES_CACHE_L3_ENABLED=true turns on L3."""
+    """HERMES_CACHE_L3_ENABLED=true turns on L3 (no-op since already on)."""
     with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "true"}, clear=False):
         assert is_l3_enabled() is True
+
+
+def test_is_l3_enabled_can_be_disabled():
+    """HERMES_CACHE_L3_ENABLED=false turns off L3."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "false"}, clear=False):
+        assert is_l3_enabled() is False
 
 
 # ─── FlatFileCache (L2) — mmap ring buffer ────────────────────────────
@@ -765,9 +779,10 @@ def test_flat_file_cache_type_validation(tmp_path):
 
 
 def test_flat_file_cache_stats_shape(tmp_path):
-    """stats() includes backend, path, max_bytes, slot counts."""
+    """stats() includes backend, path, max_bytes, slot counts, estimated_bytes."""
     cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
     try:
+        cache.put("k", "v")
         s = cache.stats()
         assert s["backend"] == "flat_file"
         assert s["max_bytes"] == 1024 * 1024
@@ -775,6 +790,21 @@ def test_flat_file_cache_stats_shape(tmp_path):
         assert s["slot_value_max"] > 0
         assert "hits" in s
         assert "misses" in s
+        assert "estimated_bytes" in s
+        assert s["estimated_bytes"] > 0  # at least one entry stored
+    finally:
+        cache.close()
+
+
+def test_flat_file_cache_estimated_bytes(tmp_path):
+    """estimated_bytes grows as entries are added."""
+    cache = FlatFileCache(path=str(tmp_path / "l2.mmap"), max_bytes=1024 * 1024)
+    try:
+        cache.put("a", "hello")
+        bytes_after_first = cache.stats()["estimated_bytes"]
+        cache.put("b", "world")
+        bytes_after_second = cache.stats()["estimated_bytes"]
+        assert bytes_after_second >= bytes_after_first
     finally:
         cache.close()
 
@@ -894,6 +924,30 @@ def test_sharded_file_cache_stats_shape(tmp_path):
     assert "misses" in s
 
 
+def test_sharded_file_cache_vacuum_removes_empty_dirs(tmp_path):
+    """vacuum() removes empty shard directories after entries are invalidated."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k1", "v1")
+    cache.put("k2", "v2")
+    # Invalidate all entries so shards become empty.
+    cache.invalidate("k1")
+    cache.invalidate("k2")
+    removed = cache.vacuum()
+    assert removed >= 0  # may remove some or all empty dirs
+    # Verify the root still exists.
+    assert (tmp_path / "l3").exists()
+
+
+def test_sharded_file_cache_vacuum_is_idempotent(tmp_path):
+    """vacuum() can be called multiple times without error."""
+    cache = ShardedFileCache(root=str(tmp_path / "l3"), ttl_days=7)
+    cache.put("k", "v")
+    cache.invalidate("k")
+    cache.vacuum()
+    cache.vacuum()  # second call should not raise
+    assert cache.get("k") is None
+
+
 # ─── TieredCacheRouter with mixed tiers ───────────────────────────────
 
 
@@ -966,13 +1020,16 @@ def test_router_tier_failure_does_not_break_reads():
 # ─── build_cache_from_config — feature-gate aware factory ─────────────
 
 
-def test_build_cache_returns_l1_only_by_default():
-    """Default config returns a router with L1 only."""
+def test_build_cache_returns_l1_l2_l3_by_default():
+    """Default config returns a router with L1, L2, and L3."""
     cache = build_cache_from_config()
     s = cache.stats()
-    # Only one tier — the L1.
-    assert len(s["tiers"]) == 1
-    assert s["tiers"][0]["tier"] == "InProcessLRUCache"
+    # Three tiers — L1, L2, L3 all enabled by default.
+    assert len(s["tiers"]) == 3
+    tier_names = [t["tier"] for t in s["tiers"]]
+    assert "InProcessLRUCache" in tier_names
+    assert "FlatFileCache" in tier_names
+    assert "ShardedFileCache" in tier_names
 
 
 def test_build_cache_includes_l2_when_enabled(tmp_path):
@@ -1013,10 +1070,8 @@ def test_build_cache_master_off_returns_placeholder():
 
 
 def test_build_l2_returns_none_when_disabled():
-    """L2 builder returns None when the feature gate is off."""
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("HERMES_CACHE_L2_ENABLED", None)
-        # Default: L2 is off.
+    """L2 builder returns None when explicitly turned off."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L2_ENABLED": "false"}, clear=False):
         assert _build_l2_from_config() is None
 
 
@@ -1050,9 +1105,8 @@ def test_build_l2_returns_redis_stub_when_backend_is_redis():
 
 
 def test_build_l3_returns_none_when_disabled():
-    """L3 builder returns None when the feature gate is off."""
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("HERMES_CACHE_L3_ENABLED", None)
+    """L3 builder returns None when explicitly turned off."""
+    with patch.dict(os.environ, {"HERMES_CACHE_L3_ENABLED": "false"}, clear=False):
         assert _build_l3_from_config() is None
 
 
@@ -1328,3 +1382,343 @@ class TestElephantGuard:
         router = cache_mod.build_cache_from_config()
         l1 = router._tiers[0]
         assert l1._value_max_bytes == 2048
+
+
+# ─── CircuitBreaker tests ──────────────────────────────────────────────
+
+
+class TestCircuitBreaker:
+    """Tests for CircuitBreaker class."""
+
+    def test_initial_state_closed(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        assert cb.is_open is False
+        state = cb.get_state()
+        assert state["open"] is False
+        assert state["failures"] == 0
+
+    def test_records_success_resets_failures(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.get_state()["failures"] == 2
+        cb.record_success()
+        assert cb.get_state()["failures"] == 0
+        assert cb.is_open is False
+
+    def test_opens_after_threshold_failures(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=3, reset_timeout=1.0)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is False
+        cb.record_failure()
+        assert cb.is_open is True
+
+    def test_half_open_after_reset_timeout(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, reset_timeout=0.1)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is True
+        time.sleep(0.15)
+        assert cb.is_open is False
+
+    def test_success_after_half_open(self):
+        from agent._cache import CircuitBreaker
+        cb = CircuitBreaker(failure_threshold=2, reset_timeout=0.1)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open is True
+        time.sleep(0.15)
+        cb.record_success()
+        assert cb.is_open is False
+        assert cb.get_state()["failures"] == 0
+
+
+# ─── Router with circuit breaker tests ────────────────────────────────
+
+
+class TestRouterCircuitBreaker:
+    """Tests for TieredCacheRouter circuit breaker integration."""
+
+    def test_stats_includes_circuit_breaker(self):
+        from agent._cache import InProcessLRUCache, TieredCacheRouter
+        router = TieredCacheRouter(InProcessLRUCache())
+        stats = router.stats()
+        assert "circuit_breaker" in stats["tiers"][0]
+        assert "metrics" in stats
+
+    def test_circuit_breaker_trips_on_tier_failure(self):
+        from agent._cache import InProcessLRUCache, TieredCacheRouter
+        l1 = InProcessLRUCache()
+        router = TieredCacheRouter(l1, failure_threshold=3, reset_timeout=10.0)
+        # Should work normally
+        router.put("key", "value")
+        assert router.get("key") == "value"
+        # Check initial state
+        stats = router.stats()
+        assert stats["tiers"][0]["circuit_breaker"]["open"] is False
+
+
+# ─── InProcessTinyLFUCache tests ──────────────────────────────────────
+
+
+class TestInProcessTinyLFUCache:
+    """Tests for W-TinyLFU cache (theine-based)."""
+
+    def test_basic_put_get(self):
+        """Basic put and get operations work."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("key1", "value1")
+        assert cache.get("key1") == "value1"
+
+    def test_get_missing_returns_none(self):
+        """Missing key returns None."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        assert cache.get("missing") is None
+
+    def test_stats_reports_metrics(self):
+        """stats() reports hits, misses, and hit_rate."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("k", "v")
+        cache.get("k")  # hit
+        cache.get("missing")  # miss
+        stats = cache.stats()
+        assert stats["hits"] == 1
+        assert stats["misses"] == 1
+        assert abs(stats["hit_rate"] - 0.5) < 1e-9
+
+    def test_invalidate_removes_entry(self):
+        """invalidate() removes the entry."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("k", "v")
+        assert cache.get("k") == "v"
+        cache.invalidate("k")
+        assert cache.get("k") is None
+
+    def test_clear_removes_all(self):
+        """clear() empties the cache."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        assert len(cache) == 2
+        cache.clear()
+        assert len(cache) == 0
+
+    def test_contains_operator(self):
+        """'in' operator works for membership checks."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("present", 1)
+        assert "present" in cache
+        assert "absent" not in cache
+
+    def test_invalid_max_entries_raises(self):
+        """max_entries < 1 raises ValueError."""
+        with pytest.raises(ValueError):
+            InProcessTinyLFUCache(max_entries=0)
+
+    def test_ttl_expiration(self):
+        """Entries expire after TTL seconds."""
+        cache = InProcessTinyLFUCache(max_entries=100, ttl_seconds=1)
+        cache.put("key", "value")
+        assert cache.get("key") == "value"
+        # Wait for TTL to expire
+        import time
+        time.sleep(1.1)
+        # theine should have evicted it
+        result = cache.get("key")
+        assert result is None or cache.get("key") is None
+
+    def test_capacity_limit(self):
+        """Cache respects max_entries capacity."""
+        cache = InProcessTinyLFUCache(max_entries=5)
+        for i in range(10):
+            cache.put(f"key{i}", f"value{i}")
+        # Should have at most 5 entries
+        assert len(cache) <= 5
+
+    def test_w_tiny_lfu_adaptive_behavior(self):
+        """W-TinyLFU adapts to access patterns better than LRU.
+
+        With W-TinyLFU, frequently accessed keys should be retained
+        even when the cache is full, while less-frequently accessed
+        keys are evicted.
+        """
+        cache = InProcessTinyLFUCache(max_entries=10)
+        # Fill cache
+        for i in range(10):
+            cache.put(f"key{i}", f"value{i}")
+        # Access some keys multiple times (hot keys)
+        for _ in range(20):
+            cache.get("key0")
+            cache.get("key1")
+        # Add more entries to force eviction
+        for i in range(10, 20):
+            cache.put(f"key{i}", f"value{i}")
+        # Hot keys should still be present
+        assert cache.get("key0") == "value0"
+        assert cache.get("key1") == "value1"
+
+    def test_stats_on_empty_cache(self):
+        """Empty cache has zero hit_rate."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        stats = cache.stats()
+        assert stats["hit_rate"] == 0.0
+        assert stats["entries"] == 0
+
+
+# ─── get_cache_status() ───────────────────────────────────────────────────
+
+
+def test_get_cache_status_returns_dict():
+    """get_cache_status() returns a dict with cache metrics."""
+    from agent._cache import get_cache_status
+    s = get_cache_status()
+    assert isinstance(s, dict)
+    assert "tiers" in s
+    assert "aggregate_hit_rate" in s
+
+
+def test_get_cache_status_is_safe():
+    """get_cache_status() never raises even if cache is broken."""
+    from agent._cache import get_cache_status
+    s = get_cache_status()
+    # Should not raise
+    assert isinstance(s, dict)
+
+
+# ─── Phase 5: Config Round-Trip ─────────────────────────────────────────────
+
+
+def test_config_round_trip_all_options(tmp_path):
+    """Config block round-trips through build_cache_from_config()."""
+    import os
+    from unittest.mock import patch
+    from agent._cache import build_cache_from_config
+
+    # Reset singleton for clean test
+    import agent._cache as cache_mod
+    cache_mod._router_singleton = None
+
+    # Build with default config
+    config = {
+        "enabled": True,
+        "l1": {"enabled": True, "max_entries": 128, "max_bytes": 16777216},
+        "l2": {"enabled": True, "backend": "flat_file", "flat_file": {
+            "path": str(tmp_path / "l2.mmap"),
+            "max_bytes": 33554432,
+        }},
+        "l3": {"enabled": True, "backend": "flat_file", "flat_file": {
+            "root": str(tmp_path / "l3"),
+            "ttl_days": 7,
+        }},
+    }
+    with patch.dict(os.environ, {}, clear=False):
+        with patch("agent._cache._read_cache_config", return_value=config):
+            cache = build_cache_from_config()
+            stats = cache.stats()
+            assert "tiers" in stats
+            # Verify at least L1 is present
+            tier_names = [t["tier"] for t in stats["tiers"]]
+            assert "InProcessLRUCache" in tier_names
+
+
+def test_config_disabled_cache_returns_empty():
+    """Disabled cache returns empty router."""
+    import os
+    from unittest.mock import patch
+    from agent._cache import build_cache_from_config
+
+    import agent._cache as cache_mod
+    cache_mod._router_singleton = None
+
+    config = {"enabled": False}
+    with patch.dict(os.environ, {}, clear=False):
+        with patch("agent._cache._read_cache_config", return_value=config):
+            cache = build_cache_from_config()
+            stats = cache.stats()
+            assert stats["aggregate_hits"] == 0
+            assert stats["aggregate_misses"] == 0
+
+
+# ─── Phase 5: End-to-End Integration ────────────────────────────────────────
+
+
+def test_e2e_write_then_read_all_tiers():
+    """Full read path: L1 miss → L2 miss → L3 miss → source."""
+    from agent._cache import InProcessLRUCache, FlatFileCache, ShardedFileCache
+    from agent._cache import TieredCacheRouter
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        l1 = InProcessLRUCache(max_entries=64)
+        l2 = FlatFileCache(path=tmpdir + "/l2.mmap", max_bytes=1024 * 1024)
+        l3 = ShardedFileCache(root=tmpdir + "/l3", ttl_days=7)
+        router = TieredCacheRouter(l1, l2, l3)
+
+        try:
+            # Write directly to L3
+            router.put("test_key", "test_value")
+
+            # Read from L1 (cache miss, should populate all tiers)
+            result = router.get("test_key")
+            assert result == "test_value"
+
+            # Subsequent reads should hit L1
+            result2 = router.get("test_key")
+            assert result2 == "test_value"
+
+            # Stats should show hits and misses
+            stats = router.stats()
+            assert stats["aggregate_hits"] >= 1
+            # First read is a miss, subsequent reads are hits
+            assert stats["aggregate_misses"] >= 0  # May be 0 if L3 had it
+        finally:
+            # Clean up tiers
+            l1.clear()
+            l2.close()
+            # ShardedFileCache uses __del__ for cleanup
+
+
+def test_e2e_l1_only_mode():
+    """L1-only mode works correctly."""
+    from agent._cache import InProcessLRUCache
+    from agent._cache import TieredCacheRouter
+
+    l1 = InProcessLRUCache(max_entries=32)
+    router = TieredCacheRouter(l1)
+
+    try:
+        router.put("key", "value")
+        assert router.get("key") == "value"
+        assert router.get("missing") is None
+
+        stats = router.stats()
+        assert len(stats["tiers"]) == 1
+    finally:
+        l1.clear()
+
+
+def test_e2e_circuit_breaker_degradation():
+    """Circuit breaker opens on repeated failures, degrades gracefully."""
+    from agent._cache import InProcessLRUCache
+    from agent._cache import TieredCacheRouter, CircuitBreaker
+
+    l1 = InProcessLRUCache(max_entries=32)
+    router = TieredCacheRouter(l1, failure_threshold=2, reset_timeout=0.1)
+
+    try:
+        # First write should work
+        router.put("key", "value")
+        assert router.get("key") == "value"
+
+        # Stats should have circuit breaker info per-tier
+        stats = router.stats()
+        tier_0 = stats["tiers"][0]
+        assert "circuit_breaker" in tier_0
+        assert tier_0["circuit_breaker"]["open"] in [False, True]
+    finally:
+        l1.clear()

@@ -2213,7 +2213,11 @@ def ai_gateway_model_ids(*, force_refresh: bool = False) -> list[str]:
 # Pricing helpers — fetch live pricing from OpenRouter-compatible /v1/models
 # ---------------------------------------------------------------------------
 
-# Cache: maps model_id → {"prompt": str, "completion": str} per endpoint
+# Cache: maps model_id -> {"prompt": str, "completion": str} per endpoint
+# Bounded at MAX_ENTRIES to prevent unbounded growth in long-running processes
+# (gateway, desktop backend run for weeks). Oldest entries (by insertion order)
+# are evicted when the limit is reached.
+_MAX_PRICING_CACHE_ENTRIES = 200
 _pricing_cache: dict[str, dict[str, dict[str, str]]] = {}
 
 # A failed fetch caches its empty result too, so an unreachable endpoint isn't
@@ -2225,6 +2229,23 @@ _pricing_cache: dict[str, dict[str, dict[str, str]]] = {}
 # the stale entry is silent and invisible.
 _FAILED_CATALOG_TTL_SECONDS = 120.0
 _pricing_cache_retry_after: dict[str, float] = {}
+
+
+def _evict_pricing_cache_if_needed() -> None:
+    """Evict oldest entries if cache exceeds MAX_ENTRIES.
+
+    Since Python 3.7+ dicts preserve insertion order, we can evict from the
+    beginning (oldest) when the limit is exceeded.
+    """
+    if len(_pricing_cache) > _MAX_PRICING_CACHE_ENTRIES:
+        # Remove oldest entries (first N to exceed limit)
+        to_remove = len(_pricing_cache) - _MAX_PRICING_CACHE_ENTRIES
+        for _ in range(to_remove):
+            _pricing_cache.popitem(last=False)
+        # Also clean up any retry_after entries for evicted keys
+        stale_retry = [k for k, v in _pricing_cache_retry_after.items() if k not in _pricing_cache]
+        for k in stale_retry:
+            _pricing_cache_retry_after.pop(k, None)
 
 
 def _cached_catalog(cache_key: str) -> Optional[dict[str, dict[str, Any]]]:
@@ -2251,6 +2272,8 @@ def _cache_catalog(
         _pricing_cache_retry_after[cache_key] = (
             time.monotonic() + _FAILED_CATALOG_TTL_SECONDS
         )
+    # Evict oldest entries if over limit
+    _evict_pricing_cache_if_needed()
     return result
 
 

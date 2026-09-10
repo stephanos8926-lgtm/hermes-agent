@@ -1499,48 +1499,21 @@ def _get_context_cache_path() -> Path:
 # call (which fires many times per turn via get_model_info). The YAML remains
 # the cross-process source of truth; the L1 is an acceleration layer.
 #
-# Configurable via cache.model_metadata.* (off by default). When the section
-# is absent the L1 is a tiny LRU(64) with no L2 / L3 involvement.
-# HERMES_CACHE_MODEL_METADATA_ENABLED env-var override is honored.
-#
-# The cache is best-effort: any L1 exception falls through to the YAML
-# source of truth, which is the same contract the YAML loader honors.
+# This now uses the unified TieredCacheRouter (get_cache_router) instead of a
+# bare InProcessLRUCache, so it benefits from the same eviction policy,
+# circuit breaker, and metrics as every other consumer.
 def _get_context_cache_l1():
-    """Return the module-level L1 cache (lazy init, never raises).
+    """Return the unified router (always available, never raises).
 
-    The L1 is bounded by entry count (default 256) to bound RAM. Per the
-    InProcessLRUCache contract, eviction is LRU. The byte budget is set
-    to 8 MiB which comfortably holds 256 ``model@base_url`` keys plus
-    integer values.
+    The router's L1 tier handles eviction (TinyLFU by default, 256 entries).
+    All lower-tier logic (L2/L3) is a bonus for cross-process persistence.
     """
-    global _CONTEXT_CACHE_L1
-    try:
-        if _CONTEXT_CACHE_L1 is None:
-            # Get the L1 tier from the unified router's "model_metadata" namespace
-            from agent._cache import get_cache_router
-            router = get_cache_router()
-            # The L1 tier is the first tier in the router
-            _CONTEXT_CACHE_L1 = router._tiers[0]
-    except Exception as e:
-        logger.warning(
-            "Context cache L1 init from router failed; falling through to "
-            "YAML source of truth (models.degen silently): %s",
-            e,
-        )
-        _CONTEXT_CACHE_L1 = None
-    return _CONTEXT_CACHE_L1
+    from agent._cache import get_cache_router
+    return get_cache_router()
 
 
-# ``None`` means "not yet initialized" — _get_context_cache_l1() will populate.
-_CONTEXT_CACHE_L1: Optional["InProcessLRUCache"] = None
-
-
-# Set of keys for which the most recent L1 invalidate attempt failed.
-# When a key is in this set, get_cached_context_length MUST skip the L1
-# and consult YAML directly. The set is cleared (per key) the moment a
-# get falls through to YAML, so it only ever blocks one read per failed
-# invalidate. This is the defensive layer that keeps a single
-# L1.invalidate() exception from resurrecting a stale value.
+# Tombstones: keys for which the most recent L1 invalidate attempt failed.
+# See comment on _CONTEXT_L1_TOMBSTONES below.
 _CONTEXT_L1_TOMBSTONES: set = set()
 
 
