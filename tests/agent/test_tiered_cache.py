@@ -27,6 +27,7 @@ from agent._cache import (
     DiskCache,
     FlatFileCache,
     InProcessLRUCache,
+    InProcessTinyLFUCache,
     RedisCache,
     ShardedFileCache,
     TieredCacheRouter,
@@ -37,6 +38,7 @@ from agent._cache import (
     _expand_path,
     _read_cache_config,
     build_cache_from_config,
+    get_cache_router,
     is_cache_enabled,
     is_l1_enabled,
     is_l2_enabled,
@@ -1407,3 +1409,110 @@ class TestRouterCircuitBreaker:
         # Check initial state
         stats = router.stats()
         assert stats["tiers"][0]["circuit_breaker"]["open"] is False
+
+
+# ─── InProcessTinyLFUCache tests ──────────────────────────────────────
+
+
+class TestInProcessTinyLFUCache:
+    """Tests for W-TinyLFU cache (theine-based)."""
+
+    def test_basic_put_get(self):
+        """Basic put and get operations work."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("key1", "value1")
+        assert cache.get("key1") == "value1"
+
+    def test_get_missing_returns_none(self):
+        """Missing key returns None."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        assert cache.get("missing") is None
+
+    def test_stats_reports_metrics(self):
+        """stats() reports hits, misses, and hit_rate."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("k", "v")
+        cache.get("k")  # hit
+        cache.get("missing")  # miss
+        stats = cache.stats()
+        assert stats["hits"] == 1
+        assert stats["misses"] == 1
+        assert abs(stats["hit_rate"] - 0.5) < 1e-9
+
+    def test_invalidate_removes_entry(self):
+        """invalidate() removes the entry."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("k", "v")
+        assert cache.get("k") == "v"
+        cache.invalidate("k")
+        assert cache.get("k") is None
+
+    def test_clear_removes_all(self):
+        """clear() empties the cache."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        assert len(cache) == 2
+        cache.clear()
+        assert len(cache) == 0
+
+    def test_contains_operator(self):
+        """'in' operator works for membership checks."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        cache.put("present", 1)
+        assert "present" in cache
+        assert "absent" not in cache
+
+    def test_invalid_max_entries_raises(self):
+        """max_entries < 1 raises ValueError."""
+        with pytest.raises(ValueError):
+            InProcessTinyLFUCache(max_entries=0)
+
+    def test_ttl_expiration(self):
+        """Entries expire after TTL seconds."""
+        cache = InProcessTinyLFUCache(max_entries=100, ttl_seconds=1)
+        cache.put("key", "value")
+        assert cache.get("key") == "value"
+        # Wait for TTL to expire
+        import time
+        time.sleep(1.1)
+        # theine should have evicted it
+        result = cache.get("key")
+        assert result is None or cache.get("key") is None
+
+    def test_capacity_limit(self):
+        """Cache respects max_entries capacity."""
+        cache = InProcessTinyLFUCache(max_entries=5)
+        for i in range(10):
+            cache.put(f"key{i}", f"value{i}")
+        # Should have at most 5 entries
+        assert len(cache) <= 5
+
+    def test_w_tiny_lfu_adaptive_behavior(self):
+        """W-TinyLFU adapts to access patterns better than LRU.
+
+        With W-TinyLFU, frequently accessed keys should be retained
+        even when the cache is full, while less-frequently accessed
+        keys are evicted.
+        """
+        cache = InProcessTinyLFUCache(max_entries=10)
+        # Fill cache
+        for i in range(10):
+            cache.put(f"key{i}", f"value{i}")
+        # Access some keys multiple times (hot keys)
+        for _ in range(20):
+            cache.get("key0")
+            cache.get("key1")
+        # Add more entries to force eviction
+        for i in range(10, 20):
+            cache.put(f"key{i}", f"value{i}")
+        # Hot keys should still be present
+        assert cache.get("key0") == "value0"
+        assert cache.get("key1") == "value1"
+
+    def test_stats_on_empty_cache(self):
+        """Empty cache has zero hit_rate."""
+        cache = InProcessTinyLFUCache(max_entries=100)
+        stats = cache.stats()
+        assert stats["hit_rate"] == 0.0
+        assert stats["entries"] == 0

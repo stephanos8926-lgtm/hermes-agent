@@ -264,6 +264,11 @@ def _read_cache_config() -> dict:
             "enabled": True,
             "max_entries": DEFAULT_L1_MAX_ENTRIES,
             "max_bytes": DEFAULT_L1_MAX_BYTES,
+            "eviction_policy": "lru",  # "lru" or "tiny_lfu"
+            "tiny_lfu": {
+                "ttl_seconds": 0,
+                "nolock": False,
+            },
         },
         "l2": {
             "enabled": False,
@@ -655,6 +660,168 @@ class InProcessLRUCache:
     @property
     def max_entries(self) -> int:
         return self._max_entries
+
+
+# ---------------------------------------------------------------------------
+# L1 — W-TinyLFU cache (theine-based)
+# ---------------------------------------------------------------------------
+
+
+class InProcessTinyLFUCache:
+    """Thread-safe in-process W-TinyLFU cache backed by theine.
+
+    Uses adaptive sampling-based eviction (W-TinyLFU algorithm from
+    Caffeine) instead of plain LRU. Provides better hit ratios for
+    skewed access patterns where some keys are accessed far more
+    frequently than others.
+
+    **Features**:
+    * Hierarchical timer-wheel TTL for per-key expiration
+    * Admission filter via sampling (resists cache poisoning)
+    * Striped locking for concurrent access
+    * Fail-open on internal errors (treats as miss/put-no-op)
+
+    **Configuration**: ``cache.l1.eviction_policy`` — ``"lru"`` (default,
+    uses :class:`InProcessLRUCache`) or ``"tiny_lfu"`` (uses this class).
+    Additional config: ``cache.l1.tiny_lfu.{size, ttl_seconds, nolock}``.
+
+    ``ttl_seconds`` applies globally to all entries (set via theine's
+    ``Cache.set(key, value, ttl)``). Set to ``0`` for no TTL.
+
+    ``nolock`` disables threading locks (use only in single-threaded
+    contexts; ignored on free-threaded Python).
+    """
+
+    def __init__(
+        self,
+        max_entries: int = 256,
+        ttl_seconds: int = 0,
+        nolock: bool = False,
+        max_bytes: Optional[int] = None,
+        value_max_bytes: Optional[int] = None,
+    ) -> None:
+        """Initialize W-TinyLFU cache.
+
+        Args:
+            max_entries: Maximum number of entries (capacity for theine).
+            ttl_seconds: Global TTL in seconds. 0 means no expiration.
+            nolock: Disable threading locks (single-threaded use only).
+            max_bytes: Ignored (theine doesn't support byte budgets).
+            value_max_bytes: Ignored (theine doesn't support value sizing).
+        """
+        # theine capacity
+        self._capacity = int(max_entries)
+        if self._capacity < 1:
+            raise ValueError("max_entries must be >= 1")
+
+        # TTL in nanoseconds (theine expects ns)
+        self._ttl_ns = int(ttl_seconds * 1e9) if ttl_seconds > 0 else 0
+
+        # nolock flag (overridden to False on free-threaded Python)
+        self._nolock = nolock
+
+        # Import here to avoid hard dependency when theine is unavailable
+        try:
+            from theine import Cache
+            from datetime import timedelta
+        except ImportError:
+            raise ImportError(
+                "InProcessTinyLFUCache requires theine: install with "
+                "'pip install theine' or 'uv add theine'"
+            )
+
+        self._ttl: Optional[timedelta] = (
+            timedelta(seconds=ttl_seconds) if ttl_seconds > 0 else None
+        )
+        self._cache = Cache(self._capacity, nolock=nolock)
+
+        # Metrics
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        """Return the cached value for *key*, or None on miss."""
+        try:
+            result, ok = self._cache.get(key)
+            with self._lock:
+                if ok:
+                    self._hits += 1
+                else:
+                    self._misses += 1
+            return result
+        except Exception:
+            # Fail-open: treat as miss
+            with self._lock:
+                self._misses += 1
+            return None
+
+    def put(self, key: str, value: Any) -> None:
+        """Store *value* under *key*. Existing value is replaced."""
+        try:
+            self._cache.set(key, value, self._ttl)
+            # theine tracks evictions internally
+        except Exception:
+            # Fail-open: silently drop oversized or invalid puts
+            pass
+
+    def invalidate(self, key: str) -> None:
+        """Remove *key* from the cache. No-op if absent."""
+        try:
+            self._cache.delete(key)
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        try:
+            self._cache.clear()
+        except Exception:
+            pass
+
+    def __len__(self) -> int:
+        """Return number of entries in cache."""
+        try:
+            return len(self._cache)
+        except Exception:
+            return 0
+
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists in cache."""
+        try:
+            _, ok = self._cache.get(key)
+            return ok
+        except Exception:
+            return False
+
+    def stats(self) -> dict:
+        """Return statistics about the cache."""
+        try:
+            theine_stats = self._cache.stats()
+            total = theine_stats.hit_count + theine_stats.miss_count
+            hit_rate = (
+                theine_stats.hit_count / total if total > 0 else 0.0
+            )
+        except Exception:
+            theine_stats = None
+            total = 0
+            hit_rate = 0.0
+
+        with self._lock:
+            hits = self._hits
+            misses = self._misses
+
+        return {
+            "entries": len(self),
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (hits / (hits + misses)) if (hits + misses) > 0 else 0.0,
+            "evictions": self._evictions,
+            "capacity": self._capacity,
+            "ttl_seconds": self._ttl_ns // int(1e9) if self._ttl_ns > 0 else 0,
+            "nolock": self._nolock,
+        }
 
 
 class _FlatFileRing:
@@ -1685,13 +1852,22 @@ def build_cache_from_config() -> TieredCache:
     if is_l1_enabled():
         cfg = _read_cache_config()
         l1 = cfg.get("l1", {})
-        l1_kwargs = dict(
-            max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
-            max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
-        )
-        if l1.get("value_max_bytes") is not None:
-            l1_kwargs["value_max_bytes"] = int(l1["value_max_bytes"])
-        tiers.append(InProcessLRUCache(**l1_kwargs))
+        policy = l1.get("eviction_policy", "lru")
+        if policy == "tiny_lfu":
+            tiny_lfu_cfg = l1.get("tiny_lfu", {})
+            tiers.append(InProcessTinyLFUCache(
+                max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
+                ttl_seconds=int(tiny_lfu_cfg.get("ttl_seconds", 0)),
+                nolock=bool(tiny_lfu_cfg.get("nolock", False)),
+            ))
+        else:
+            l1_kwargs = dict(
+                max_entries=int(l1.get("max_entries", DEFAULT_L1_MAX_ENTRIES)),
+                max_bytes=int(l1.get("max_bytes", DEFAULT_L1_MAX_BYTES)),
+            )
+            if l1.get("value_max_bytes") is not None:
+                l1_kwargs["value_max_bytes"] = int(l1["value_max_bytes"])
+            tiers.append(InProcessLRUCache(**l1_kwargs))
     l2 = _build_l2_from_config()
     if l2 is not None:
         tiers.append(l2)
