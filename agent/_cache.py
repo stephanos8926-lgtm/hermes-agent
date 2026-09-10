@@ -1867,6 +1867,14 @@ class TieredCacheRouter:
                 self._breakers[i].record_failure()
                 pass
 
+    def clear(self) -> None:
+        """Clear all tiers. Useful for tests."""
+        for tier in self._tiers:
+            try:
+                tier.clear()
+            except Exception:
+                pass
+
     def stats(self) -> dict:
         """Return per-tier stats plus an aggregate hit-rate."""
         per_tier = []
