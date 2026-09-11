@@ -3207,7 +3207,7 @@ class ContextCompressor(ContextEngine):
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
-        self.custom_compaction_prompt = custom_compaction_prompt or ""
+        self.custom_compaction_prompt = compaction_prompt_override or ""
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
