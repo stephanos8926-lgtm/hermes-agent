@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 from hermes_cli.cli_output import line_input
+from hermes_cli.env_loader import load_hermes_dotenv
 import json
 import logging
 import os
@@ -3358,6 +3359,9 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     venv_bin = project_root / "venv" / "bin"
     if _is_dir(venv_bin):
         candidates.append(str(venv_bin))
+    venv_dot = project_root / ".venv" / "bin"
+    if _is_dir(venv_dot):
+        candidates.append(str(venv_dot))
     elif sys.prefix != sys.base_prefix:
         candidates.append(str(Path(sys.prefix) / "bin"))
 
@@ -3507,6 +3511,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     working_dir = _stable_service_working_dir()
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    env_paths = load_hermes_dotenv()
+    hermes_env_file = str(env_paths[0]) if env_paths else ''
 
     path_entries = _build_service_path_dirs()
     if not system:
@@ -3579,7 +3585,9 @@ Environment="USER={username}"
 Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
+EnvironmentFile=-{hermes_env_file}
 Environment="HERMES_HOME={hermes_home}"
+Environment="PYTHONPATH={hermes_plugins_path}:{workspaces_path}"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -3617,7 +3625,9 @@ Type={systemd_type}
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
+EnvironmentFile=-{hermes_env_file}
 Environment="HERMES_HOME={hermes_home}"
+Environment="PYTHONPATH={hermes_plugins_path}:{workspaces_path}"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
