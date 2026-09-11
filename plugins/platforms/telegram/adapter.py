@@ -771,6 +771,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # as plain text, which is worse than degraded table/task-list rendering
         # for command snippets and mobile handoffs.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        # Allow disabling rich rendering specifically for tables.
+        # When false, tables fall through to the legacy MarkdownV2 path and
+        # get converted to bullet groups by format_message() — avoiding
+        # "message not supported" errors on older Telegram Desktop clients
+        # that can't render Bot API 10.1 RichBlockTable.
+        self._rich_tables_enabled: bool = self._coerce_bool_extra("rich_tables", True)
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
@@ -2080,7 +2086,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not content:
             return False
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
-            return True
+            return self._rich_tables_enabled
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
             return True
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
