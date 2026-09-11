@@ -342,10 +342,11 @@ class TestStripMdv2:
 
 
 class TestWrapMarkdownTables:
-    """_wrap_markdown_tables rewrites GFM pipe tables into Telegram-friendly
-    row groups instead of leaving noisy pipe syntax in the final message."""
+    """_wrap_markdown_tables wraps GFM pipe tables in ``` fenced code blocks
+    so Telegram renders them as monospace preformatted text with alignment intact.
+    """
 
-    def test_basic_table_rewritten_as_row_groups(self):
+    def test_basic_table_wrapped_in_code_block(self):
         text = (
             "Scores:\n\n"
             "| Player | Score |\n"
@@ -355,74 +356,58 @@ class TestWrapMarkdownTables:
             "\nEnd."
         )
         out = _wrap_markdown_tables(text)
-        assert "**Alice**" in out
-        # The heading IS the Player cell — don't repeat it as a bullet.
-        assert "• Player: Alice" not in out
-        assert "• Score: 150" in out
-        assert "**Bob**" in out
-        assert "• Score: 120" in out
-        # Heading and its bullet sit on consecutive lines (no blank between).
-        assert "**Alice**\n• Score: 150" in out
-        # Separate row groups ARE separated by a blank line.
-        assert "• Score: 150\n\n**Bob**" in out
-        # Surrounding prose is preserved
+        # Table should be wrapped in code fences
+        assert "```" in out
+        assert out.count("```") == 2
+        # Table content preserved inside fence
+        assert "| Player | Score |" in out
+        assert "| Alice  | 150   |" in out
+        assert "| Bob    | 120   |" in out
+        # Surrounding prose preserved
         assert out.startswith("Scores:")
         assert out.endswith("End.")
 
-    def test_bare_pipe_table_rewritten(self):
+    def test_bare_pipe_table_wrapped(self):
         """Tables without outer pipes (GFM allows this) are still detected."""
         text = "head1 | head2\n--- | ---\na | b\nc | d"
         out = _wrap_markdown_tables(text)
-        assert out.startswith("**a**")
-        # No duplicate first bullet — heading 'a' already shows the head1 value.
-        assert "• head1: a" not in out
-        assert "• head2: b" in out
-        assert "**c**" in out
-
+        assert out.startswith("```")
+        assert out.endswith("```")
+        assert "head1 | head2" in out
+        assert "--- | ---" in out
+        assert "a | b" in out
+        assert "c | d" in out
 
     def test_no_pipe_character_short_circuits(self):
         text = "Plain **bold** text with no table."
         assert _wrap_markdown_tables(text) == text
 
+    def test_tables_inside_code_blocks_left_alone(self):
+        """Tables already inside fenced code blocks are not double-wrapped."""
+        text = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```"
+        out = _wrap_markdown_tables(text)
+        assert out == text
+        # Only the original fences
+        assert out.count("```") == 2
 
-    def test_row_group_uses_single_newlines_within_group(self):
-        """Regression: each bullet within a row-group must be separated by
-        a single newline, not a blank line.  Telegram renders blank lines
-        as paragraph breaks, which previously left every bullet floating in
-        its own paragraph and made multi-column tables unreadable.
-
-        Mirrors the exact pattern that produced the screenshot bug report:
-        a five-column comparison table with no row-label column.
-        """
+    def test_multiple_tables_each_wrapped(self):
         text = (
-            "| Play | Capital | Build | $/day | Risk |\n"
-            "|---|---|---|---|---|\n"
-            "| A. Copy Hands (HK/SZ) | $5-10k | 2 wk | $30-70 | Low |\n"
-            "| B. NO-sweeper        | $50-100k | 3 wk | $300-1000 | Med |"
+            "| A | B |\n"
+            "|---|---|\n"
+            "| 1 | 2 |\n"
+            "\n\n"
+            "| X | Y |\n"
+            "|---|---|\n"
+            "| 3 | 4 |\n"
         )
         out = _wrap_markdown_tables(text)
-
-        # No bullet sits inside its own paragraph: the substring "\n\n• "
-        # would mean a blank line precedes a bullet, which is the bug.
-        assert "\n\n• " not in out
-
-        # The two row-groups DO have a paragraph break between them.
-        groups = [g for g in out.split("\n\n") if g.strip()]
-        assert len(groups) == 2
-        # Heading + 4 bullets per group means each group is exactly 5 lines.
-        for group in groups:
-            line_count = group.count("\n") + 1
-            assert line_count == 5, (
-                "Each row-group should be 5 lines (heading + 4 bullets), "
-                f"got {line_count}:\n{group}"
-            )
+        assert out.count("```") == 4  # Two tables = 4 fences
 
 
 class TestFormatMessageTables:
-    """End-to-end: pipe tables become readable Telegram-native text instead
-    of escaped pipe syntax or fenced code blocks."""
+    """End-to-end: pipe tables become code blocks in Telegram output."""
 
-    def test_table_rendered_as_bullets(self, adapter):
+    def test_table_wrapped_in_code_block(self, adapter):
         text = (
             "Data:\n\n"
             "| Col1 | Col2 |\n"
@@ -430,12 +415,11 @@ class TestFormatMessageTables:
             "| A    | B    |\n"
         )
         out = adapter.format_message(text)
-        assert "*A*" in out
-        # Heading 'A' duplicates the Col1 value — skip that bullet.
-        assert "• Col1: A" not in out
-        assert "• Col2: B" in out
-        assert "```" not in out
-        assert "\\|" not in out
+        assert "```" in out
+        assert out.count("```") == 2
+        assert "| Col1 | Col2 |" in out
+        assert "| A    | B    |" in out
+        assert "\\|" not in out  # Pipes not escaped inside code block
 
 
 @pytest.mark.asyncio

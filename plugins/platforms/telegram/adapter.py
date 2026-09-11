@@ -533,18 +533,79 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Markdown table → Telegram-friendly row groups
+# Markdown table → code block wrapping (for Telegram MarkdownV2)
 # ---------------------------------------------------------------------------
 # Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
 # so pipe tables render as noisy backslash-pipe text with no alignment.
-# The shared convert_table_to_bullets() in gateway.platforms.helpers handles
-# the full conversion (detection + rendering); Telegram just calls it.
+# Wrapping the table in a fenced code block makes Telegram render it as
+# monospace preformatted text with columns intact.
+# Tables already inside an existing code block are left alone.
 
 from gateway.platforms.helpers import (
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE,
     compile_mention_patterns,
-    convert_table_to_bullets as _wrap_markdown_tables,
 )
+
+
+def _is_table_row(line: str) -> bool:
+    """Return True if *line* could plausibly be a table data row."""
+    stripped = line.strip()
+    return bool(stripped) and '|' in stripped
+
+
+def _wrap_markdown_tables(text: str) -> str:
+    """Wrap GFM-style pipe tables in ``` fences so Telegram renders them.
+
+    Detected by a row containing '|' immediately followed by a delimiter
+    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent pipe-containing
+    non-blank lines are consumed as the table body and included in the
+    wrapped block.  Tables inside existing fenced code blocks are left
+    alone.
+    """
+    if '|' not in text or '-' not in text:
+        return text
+
+    lines = text.split('\n')
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Track existing fenced code blocks — never touch content inside.
+        if stripped.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        # Look for a header row (contains '|') immediately followed by a
+        # delimiter row.
+        if (
+            '|' in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            table_block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and _is_table_row(lines[j]):
+                table_block.append(lines[j])
+                j += 1
+            out.append('```')
+            out.extend(table_block)
+            out.append('```')
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+
+    return '\n'.join(out)
 
 
 # ---------------------------------------------------------------------------
