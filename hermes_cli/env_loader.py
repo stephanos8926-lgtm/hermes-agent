@@ -552,6 +552,16 @@ def load_hermes_dotenv(
     # what lands in the env.
     _reapply_terminal_config_bridge(home_path)
 
+    # ── EnvironmentFile injection for systemd ──────────────────────────
+    # Systemd requires an EnvironmentFile= directive so that .env values
+    # are available before the Python process starts and env_loader can
+    # call load_hermes_dotenv().  The gateway service generator below
+    # (gateway.py::_build_service_unit_text) injects EnvironmentFile=-<H>/.env
+    # automatically when HERMES_HOME is writable.
+    #
+    # Manual installers may also add it to their unit:
+    #   EnvironmentFile=-/home/<user>/.hermes/.env
+    # ─────────────────────────────────────────────────────────────────────
     return loaded
 
 
