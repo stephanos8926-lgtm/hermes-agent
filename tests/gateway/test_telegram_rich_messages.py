@@ -410,9 +410,12 @@ def test_prefers_fresh_final_streaming_for_dm_topic_tables():
 
 @pytest.mark.asyncio
 async def test_legacy_draft_stream_finalizes_with_persistent_rich_message():
-    """A plain draft must not force the persistent final to MarkdownV2."""
-    adapter = _make_adapter()  # rich messages on, rich drafts off
-    assert adapter.supports_draft_streaming(chat_type="dm") is True
+    """A MarkdownV2 draft must not force the persistent final to MarkdownV2."""
+    adapter = _make_adapter() # rich messages on, rich drafts off
+    # With the gate in supports_draft_streaming, draft streaming is declined
+    # when rich_drafts is off. The test force-enables it to verify that even
+    # a legacy MDV2 draft still finalizes as a rich message.
+    assert adapter.supports_draft_streaming(chat_type="dm") is False
 
     consumer = GatewayStreamConsumer(
         adapter,
@@ -440,9 +443,12 @@ async def test_legacy_draft_stream_finalizes_with_persistent_rich_message():
 
 
 def test_supports_plain_draft_streaming_when_rich_without_rich_drafts():
-    adapter = _make_adapter()  # rich_messages True, rich_drafts default False
-    assert adapter.supports_draft_streaming(chat_type="dm") is True
-    assert adapter.supports_draft_streaming(chat_type="private") is True
+    """When rich_messages is on but rich_drafts is off, drafts are declined."""
+    adapter = _make_adapter()
+    assert adapter.supports_draft_streaming(chat_type="dm") is False
+    assert adapter.supports_draft_streaming(chat_type="private") is False
+    # Group chats still decline
+    assert adapter.supports_draft_streaming(chat_type="group") is False
 
 
 @pytest.mark.asyncio
@@ -462,8 +468,11 @@ async def test_rich_table_uses_raw_plain_draft_before_persistent_rich_final():
 
 @pytest.mark.asyncio
 async def test_dm_table_stream_persists_through_send_rich_message():
-    """Exercise the reporter's transport: ephemeral DM draft, then rich final."""
+    """With rich_messages on and rich_drafts off, transport=auto uses
+    edit-in-place (no drafts) and finalizes via rich editMessageText.
+    """
     adapter = _make_adapter()  # rich messages on, rich drafts off
+    assert adapter.supports_draft_streaming(chat_type="dm") is False
     consumer = GatewayStreamConsumer(
         adapter,
         "12345",
@@ -482,14 +491,11 @@ async def test_dm_table_stream_persists_through_send_rich_message():
     consumer.finish()
     await task
 
-    adapter._bot.send_message_draft.assert_awaited()
-    draft_kwargs = adapter._bot.send_message_draft.call_args.kwargs
-    assert draft_kwargs["text"] == RICH_CONTENT
-    assert "parse_mode" not in draft_kwargs
+    # No draft frames — edit-in-place is used instead
+    adapter._bot.send_message_draft.assert_not_awaited()
+    # Final goes through rich editMessageText
     rich_endpoints = [call.args[0] for call in adapter._bot.do_api_request.await_args_list]
-    assert rich_endpoints == ["sendRichMessage"]
-    adapter._bot.edit_message_text.assert_not_called()
-    adapter._bot.send_message.assert_not_called()
+    assert "editMessageText" in rich_endpoints
 
 
 TOPIC_METADATA = {
@@ -530,8 +536,11 @@ async def test_send_draft_routes_dm_topic_thread_id_as_int():
 
 @pytest.mark.asyncio
 async def test_dm_topic_table_stream_uses_send_rich_message():
-    """Happy-path topic stream: drafts land, persistent final is rich."""
-    adapter = _make_adapter()
+    """With rich_messages on and rich_drafts off in a DM topic, transport=auto
+    uses edit-in-place (no drafts) and finalizes via rich editMessageText.
+    """
+    adapter = _make_adapter()  # rich messages on, rich drafts off
+    assert adapter.supports_draft_streaming(chat_type="dm") is False
     consumer = GatewayStreamConsumer(
         adapter,
         "12345",
@@ -552,16 +561,12 @@ async def test_dm_topic_table_stream_uses_send_rich_message():
     consumer.finish()
     await task
 
-    adapter._bot.send_message_draft.assert_awaited()
-    draft_kwargs = adapter._bot.send_message_draft.call_args.kwargs
-    assert draft_kwargs["text"] == TOPIC_TABLE
-    assert draft_kwargs["message_thread_id"] == 20189
+    # No draft frames — edit-in-place is used instead
+    adapter._bot.send_message_draft.assert_not_awaited()
     rich_endpoints = [call.args[0] for call in adapter._bot.do_api_request.await_args_list]
-    # Invariant, not a frozen call list: the persistent final goes through
-    # sendRichMessage, and no rich DRAFT frames fire (rich_drafts is off).
+    # Persistent final goes through sendRichMessage (topic prefers fresh send)
     assert "sendRichMessage" in rich_endpoints
     assert "sendRichMessageDraft" not in rich_endpoints
-    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio

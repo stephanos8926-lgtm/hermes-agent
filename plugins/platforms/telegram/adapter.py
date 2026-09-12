@@ -841,10 +841,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
-        # When rich_messages is on but rich_drafts is off, keep native DM draft
-        # *transport* and only skip rich draft *rendering*. The persistent
-        # reply still lands through sendRichMessage so tables are not flattened
-        # by the MarkdownV2 formatter.
+        # When rich_messages is on but rich_drafts is off, supports_draft_streaming
+        # declines drafts so transport=auto uses edit-in-place + rich finalize
+        # instead of MDV2 drafts that jump to sendRichMessage at the end.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
@@ -6193,15 +6192,21 @@ class TelegramAdapter(BasePlatformAdapter):
         (added to python-telegram-bot in 22.6); older PTB installs gracefully
         fall back to the edit path even on DMs.
 
-        ``rich_drafts`` controls the draft *format*, not whether native draft
-        streaming is available.  When final rich delivery is enabled but rich
-        drafts are not, keep the preview ephemeral and persist the completed
-        response through ``sendRichMessage``.  A plain message edited in place
-        cannot be relied on to upgrade through ``editMessageText``'s
-        ``rich_message`` parameter; when that edit is rejected, the fallback
-        formatter permanently turns tables into bullet lists.
+        When ``rich_messages`` is enabled but ``rich_drafts`` is not, decline
+        drafts even on DMs.  Final delivery then uses ``sendRichMessage`` /
+        rich ``editMessageText``, while the default draft path still renders
+        MarkdownV2 (tables → bullet lists).  That mismatch makes the streaming
+        preview look unformatted/"crooked" and the finalized reply a second
+        beautiful wiki-style bubble.  Prefer edit-in-place streaming so the
+        same message upgrades via rich finalize.  Operators who want animated
+        rich drafts opt in with ``rich_drafts: true``.
         """
         if not self._bot or not hasattr(self._bot, "send_message_draft"):
+            return False
+        if (
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_drafts_enabled", False)
+        ):
             return False
         return (chat_type or "").lower() in {"dm", "private"}
 
